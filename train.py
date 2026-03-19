@@ -174,7 +174,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         image_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss
         loss = image_loss.clone()
         
-        # scale loss
+        # scale loss（展平3DGS）
         if visibility_filter.sum() > 0:
             scale = gaussians.get_scaling[visibility_filter]
             sorted_scale, _ = torch.sort(scale, dim=-1)
@@ -261,9 +261,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     image_weight = image_weight.detach().cpu().numpy()
                     image_weight = (image_weight * 255).clip(0, 255).astype(np.uint8)
                     image_weight_color = cv2.applyColorMap(image_weight, cv2.COLORMAP_JET)
+                    geo_loss_map = pixel_noise.detach().cpu().numpy().reshape(H, W)
+                    d_mask_np = d_mask.detach().cpu().numpy().reshape(H, W)
+                    geo_loss_map[~d_mask_np] = 0
+                    valid_vals = geo_loss_map[d_mask_np]
+                    min_v, max_v = valid_vals.min(), valid_vals.max()
+                    geo_loss_map[d_mask_np] = (valid_vals - min_v) / (max_v - min_v + 1e-20)
+                    geo_loss_map = (geo_loss_map * 255).astype(np.uint8)
+                    geo_loss_color = cv2.applyColorMap(geo_loss_map, cv2.COLORMAP_JET)
                     row0 = np.concatenate([gt_img_show, img_show, normal_show, distance_color], axis=1)
                     row1 = np.concatenate([d_mask_show_color, depth_color, depth_normal_show, image_weight_color], axis=1)
-                    image_to_show = np.concatenate([row0, row1], axis=0)
+                    row2 = np.concatenate([geo_loss_color, geo_loss_color, geo_loss_color, geo_loss_color], axis=1)
+                    image_to_show = np.concatenate([row0, row1, row2], axis=0)
                     cv2.imwrite(os.path.join(debug_path, "%05d"%iteration + "_" + viewpoint_cam.image_name + ".jpg"), image_to_show)
 
                 if d_mask.sum() > 0:
