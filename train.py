@@ -29,6 +29,7 @@ from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from scene.app_model import AppModel
 from scene.cameras import Camera
+from scene.mesh_model import MeshModel
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -122,6 +123,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter += 1
     debug_path = os.path.join(scene.model_path, "debug")
     os.makedirs(debug_path, exist_ok=True)
+    observe_count = torch.zeros((gaussians.get_xyz.shape[0],), dtype=torch.bool, device="cuda")
+    # Pre-create mesh_model to avoid repeated instantiation inside the loop
+    mesh_model = MeshModel(
+        grid_res=256,
+        dpsr_sig=0.5,
+        density_thres=0.0,
+        nerf_normalization=scene.nerf_normalization,
+        normalization_mode="aabb",
+        aabb_padding=0.05,
+        device="cuda",
+    )
 
     for iteration in range(first_iter, opt.iterations + 1):
         # if network_gui.conn == None:
@@ -151,6 +163,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
         gt_image, gt_image_gray = viewpoint_cam.get_image()
+        train_bg = torch.tensor(bg_color, dtype=torch.float32, device="cuda").view(3, 1, 1).expand_as(gt_image)
+        if viewpoint_cam.gt_alpha_mask is not None:
+            gt_alpha_mask = viewpoint_cam.gt_alpha_mask.cuda()
+            gt_image = gt_image * gt_alpha_mask + train_bg * (1 - gt_alpha_mask)
         if iteration > 1000 and opt.exposure_compensation:
             gaussians.use_app = True
 
@@ -163,6 +179,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             return_plane=iteration>opt.single_view_weight_from_iter, return_depth_normal=iteration>opt.single_view_weight_from_iter)
         image, viewspace_point_tensor, visibility_filter, radii = \
             render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        
+        # 统计视角方向，用于后续修正法线
+        with torch.no_grad():
+            if observe_count.shape[0] != gaussians.get_xyz.shape[0]:
+                observe_count = torch.zeros((gaussians.get_xyz.shape[0],), dtype=torch.bool, device="cuda")
+            gaussians.add_view_dir_stat(viewpoint_cam.camera_center, visibility_filter)
+            observe_count |= visibility_filter
         
         # Loss
         ssim_loss = (1.0 - ssim(image, gt_image))
@@ -341,6 +364,49 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss.backward()
         iter_end.record()
 
+        if (iteration == 8000):
+            # 每100次进行拓扑更新 (Update Spatial Index)
+            #viz_path = os.path.join(scene.model_path, "debug_viz", f"view_dirs_{iteration}.ply")
+            #gaussians.save_view_dir_viz(viz_path)
+            # [2] 保存修正后的几何法线 (应该和上面大致同向)
+            viz_path_norm = os.path.join(scene.model_path, "debug_viz", f"oriented_normals_{iteration}.ply")
+            gaussians.save_oriented_normal_viz(viz_path_norm, opacity_threshold=opt.mesh_opacity_threshold)
+            # [NEW] 保存有向点云PLY（带权重）
+            viz_path_oriented_pc = os.path.join(scene.model_path, "debug_viz", f"oriented_pointcloud_{iteration}.ply")
+            gaussians.save_oriented_pointcloud_ply(viz_path_oriented_pc, opacity_threshold=opt.mesh_opacity_threshold, normalize_weight=True, visibility_mask=observe_count > 0, log_weight=True)
+
+            '''out_path = os.path.join(scene.model_path, "debug_viz", f"occ_init_mesh_{iteration}.ply")
+            res = mesh_model.export_occupancy_init_from_gaussians(
+                gaussians.get_xyz,
+                gaussians.get_rotation,
+                gaussians.get_scaling,
+                gaussians.get_opacity,
+                out_path,
+                occ_res=256,
+                opacity_threshold=opt.mesh_opacity_threshold,
+            )
+            if res is None:
+                print("DEBUG: Skip occupancy init mesh at iter 1, no gaussians after opacity mask.")
+            else:
+                print(f"DEBUG: Occupancy init mesh saved to {res['path']}, V={res['verts'].shape[0]}, F={res['faces'].shape[0]}")'''
+            
+            points, normals, weights, _ = gaussians.extract_oriented_pointcloud(
+                opacity_threshold=opt.mesh_opacity_threshold,
+                normalize_weight=True,
+                visibility_mask=observe_count > 0,
+                log_weight=False,
+            )
+            if points.shape[0] > 0:
+                mesh_out = mesh_model.reconstruct(points, normals, weights)
+                mesh_path = os.path.join(scene.model_path, "debug_viz", f"dpsr_diffmc_mesh_{iteration}.ply")
+                mesh_model.save_mesh_ply(mesh_path, mesh_out["verts"], mesh_out["faces"])
+                print(f"DEBUG: DPSR+DiffMC mesh saved to {mesh_path}, V={mesh_out['verts'].shape[0]}, F={mesh_out['faces'].shape[0]}")
+            else:
+                print("DEBUG: Skip DPSR+DiffMC at iter 8000, no points after mask.")
+
+        if iteration % 100 == 0:
+            observe_count.zero_()
+        
         with torch.no_grad():
             # Progress bar
             ema_loss_for_log = 0.4 * image_loss.item() + 0.6 * ema_loss_for_log

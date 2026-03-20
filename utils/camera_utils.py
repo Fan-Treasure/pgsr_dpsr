@@ -11,6 +11,7 @@
 
 from scene.cameras import Camera
 import numpy as np
+from utils.general_utils import PILtoTorch
 from utils.graphics_utils import fov2focal
 import sys
 
@@ -42,8 +43,13 @@ def loadCam(args, id, cam_info, resolution_scale):
     sys.stdout.write("load camera {}".format(id))
     sys.stdout.flush()
 
+    if len(cam_info.image.split()) > 3:
+        loaded_mask = PILtoTorch(cam_info.image.split()[3], resolution)
+    else:
+        loaded_mask = None
+
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
-                  FoVx=cam_info.FovX, FoVy=cam_info.FovY,
+                  FoVx=cam_info.FovX, FoVy=cam_info.FovY, gt_alpha_mask=loaded_mask,
                   image_width=resolution[0], image_height=resolution[1],
                   image_path=cam_info.image_path,
                   image_name=cam_info.image_name, uid=cam_info.global_id, 

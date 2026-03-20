@@ -74,6 +74,7 @@ class GaussianModel:
         self.knn_idx = None
         self.setup_functions()
         self.use_app = False
+        self.view_dir_accumulation = None
 
     def capture(self):
         return (
@@ -365,6 +366,8 @@ class GaussianModel:
         self.denom_abs = self.denom_abs[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.max_weight = self.max_weight[valid_points_mask]
+        if self.view_dir_accumulation is not None:
+            self.view_dir_accumulation = self.view_dir_accumulation[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -411,6 +414,11 @@ class GaussianModel:
         self.denom_abs = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self.max_weight = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        # 新生成的点还没有视角统计，用 0 填充
+        new_dirs = torch.zeros((new_xyz.shape[0], 3), device="cuda")
+        if self.view_dir_accumulation is None:
+            self.view_dir_accumulation = torch.zeros((self._xyz.shape[0] - new_xyz.shape[0], 3), device="cuda")
+        self.view_dir_accumulation = torch.cat((self.view_dir_accumulation, new_dirs), dim=0)
 
     def densify_and_split(self, grads, grad_threshold, grads_abs, grad_abs_threshold, scene_extent, max_radii2D, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -555,3 +563,240 @@ class GaussianModel:
         pts = (pts-T)@R.transpose(-1,-2)
         return pts
     
+    
+    # 在训练循环中调用的函数，用于更新方向统计
+    def add_view_dir_stat(self, cam_center, visibility_filter):
+        """
+        在每次迭代中调用。
+        cam_center: 当前相机的中心 [3]
+        visibility_filter: 当前视图中哪些高斯是可见的 [N] (bool)
+        """
+        if self.view_dir_accumulation is None:
+            # 处理加载旧模型的情况
+            self.view_dir_accumulation = torch.zeros((self._xyz.shape[0], 3), device="cuda")
+        
+        # 计算从高斯指向相机的向量
+        # visible_xyz = self._xyz[visibility_filter]
+        # dirs = cam_center - visible_xyz
+        # dirs = torch.nn.functional.normalize(dirs, dim=1)
+        
+        # 这种写法可能会在反向传播时稍慢，尽量简化
+        # 我们只更新可见的高斯
+        
+        # 获取可见点的索引
+        visible_indices = torch.where(visibility_filter)[0]
+        if len(visible_indices) == 0: return
+
+        visible_points = self._xyz[visible_indices].detach()
+        dirs = cam_center - visible_points
+        # 归一化很重要
+        dirs = torch.nn.functional.normalize(dirs, dim=1)
+        
+        # 累加
+        self.view_dir_accumulation[visible_indices] += dirs
+    
+    def get_oriented_normal(self):
+        """
+        获取经过视角统计修正后的法线
+        """
+        # 1. 原始无向法线
+        raw_normal = self.get_smallest_axis()
+        
+        # 2. 平均视角方向（代表“外部”）
+        # 如果没有统计数据（比如刚开始），回退到 raw
+        if self.view_dir_accumulation is None:
+            return raw_normal
+             
+        # 3. 检查方向
+        # dot(n, view) > 0 代表法线指向相机（即朝外）
+        # dot(n, view) < 0 代表法线背离相机（即朝内，需要翻转）
+        
+        dot_check = torch.sum(raw_normal * self.view_dir_accumulation, dim=1, keepdim=True)
+        
+        # 如果点积为负，说明当前法线指向物体内部，需要翻转
+        sign = torch.sign(dot_check)
+        sign[sign == 0] = 1.0
+        
+        return raw_normal * sign
+    
+    def save_view_dir_viz(self, path):
+        """
+        导出 PLY 用于调试：
+        - 顶点位置: 高斯中心
+        - 顶点法线: 累积的视角方向 (view_dir_accumulation)
+        - 顶点颜色: 映射方向到 RGB (X->R, Y->G, Z->B)
+        """
+        mkdir_p(os.path.dirname(path))
+
+        xyz = self._xyz.detach().cpu().numpy()
+        
+        # 获取用于可视化的向量
+        if self.view_dir_accumulation is not None:
+            # 归一化以便在颜色中显示
+            dirs = torch.nn.functional.normalize(self.view_dir_accumulation, dim=1)
+            normals = dirs.detach().cpu().numpy()
+        else:
+            normals = np.zeros_like(xyz)
+
+        # 将方向映射到 0-1 颜色空间以便肉眼观察: (-1,1) -> (0,1)
+        colors = (normals + 1) / 2.0
+        
+        # 构造 PLY 数据
+        dtype_full = [('x', 'f4'), ('y', 'f4'), ('z', 'f4'), 
+                      ('nx', 'f4'), ('ny', 'f4'), ('nz', 'f4'), 
+                      ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')]
+        
+        elements = np.empty(xyz.shape[0], dtype=dtype_full)
+        
+        elements['x'] = xyz[:, 0]
+        elements['y'] = xyz[:, 1]
+        elements['z'] = xyz[:, 2]
+        elements['nx'] = normals[:, 0]
+        elements['ny'] = normals[:, 1]
+        elements['nz'] = normals[:, 2]
+        elements['red'] = (colors[:, 0] * 255).astype(np.uint8)
+        elements['green'] = (colors[:, 1] * 255).astype(np.uint8)
+        elements['blue'] = (colors[:, 2] * 255).astype(np.uint8)
+        
+        el = PlyElement.describe(elements, 'vertex')
+        PlyData([el]).write(path)
+        print(f"DEBUG: View direction visualization saved to {path}")
+
+    # [NEW] 导出修正后的法线 (Oriented Normals)
+    def save_oriented_normal_viz(self, path, opacity_threshold=0.0):
+        """
+        导出 PLY 用于调试：
+        - 顶点位置: 高斯中心
+        - 顶点法线: 修正后的法线
+        - 顶点颜色: 将修正后的法线映射到颜色空间
+        """
+        mkdir_p(os.path.dirname(path))
+
+        # 1. 准备数据
+        xyz = self._xyz.detach().cpu().numpy()
+        opacities = self.get_opacity.detach().cpu().numpy()
+        
+        # 2. 修正法线
+        if self.view_dir_accumulation is not None:
+            normals_tensor = self.get_oriented_normal().detach()
+            normals = normals_tensor.cpu().numpy()
+        else:
+            normals = np.zeros_like(xyz)
+
+        # 3. 筛选不透明度
+        mask = (opacities.squeeze() > opacity_threshold)
+        xyz = xyz[mask]
+        normals = normals[mask]
+
+        # 将法线映射到 0-1 颜色空间
+        colors = (normals + 1) / 2.0
+        
+        # 构造 PLY 数据
+        dtype_full = [('x', 'f4'), ('y', 'f4'), ('z', 'f4'), 
+                      ('nx', 'f4'), ('ny', 'f4'), ('nz', 'f4'), 
+                      ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')]
+        
+        elements = np.empty(xyz.shape[0], dtype=dtype_full)
+        
+        elements['x'] = xyz[:, 0]
+        elements['y'] = xyz[:, 1]
+        elements['z'] = xyz[:, 2]
+        elements['nx'] = normals[:, 0]
+        elements['ny'] = normals[:, 1]
+        elements['nz'] = normals[:, 2]
+        elements['red'] = (colors[:, 0] * 255).astype(np.uint8)
+        elements['green'] = (colors[:, 1] * 255).astype(np.uint8)
+        elements['blue'] = (colors[:, 2] * 255).astype(np.uint8)
+        
+        el = PlyElement.describe(elements, 'vertex')
+        PlyData([el]).write(path)
+        print(f"DEBUG: Oriented norms saved to {path} (Th={opacity_threshold}, N={xyz.shape[0]})")
+
+    def extract_oriented_pointcloud(self, opacity_threshold=0.0, normalize_weight=True, visibility_mask=None, log_weight=False):
+        """
+        导出有向点云（中心点版本）：
+        - points: 高斯中心
+        - normals: 视角统计翻转后的法线
+        - weights: opacity * area(最大两轴乘积)
+
+        返回:
+            points [M, 3], normals [M, 3], weights [M], mask [N]
+        """
+        points = self.get_xyz
+        normals = self.get_oriented_normal()
+
+        opacity = self.get_opacity.squeeze(-1)
+        scales = self.get_scaling
+        sorted_scales, _ = torch.sort(scales, dim=-1)
+        area = sorted_scales[:, 1] * sorted_scales[:, 2]
+        weights = opacity
+
+        mask = opacity > opacity_threshold
+
+        if visibility_mask is not None:
+            mask = mask & visibility_mask.bool()
+
+        points = points[mask]
+        normals = normals[mask]
+        weights = weights[mask]
+
+        '''if log_weight and weights.numel() > 0:
+            weights = torch.log1p(weights)'''
+        if normalize_weight and weights.numel() > 0:
+            weights = weights / (weights.max() + 1e-8)
+
+        return points, normals, weights, mask
+
+    def save_oriented_pointcloud_ply(self, path, opacity_threshold=0.0, normalize_weight=True, visibility_mask=None, log_weight=False):
+        """
+        保存有向点云到 PLY：
+        - x, y, z
+        - nx, ny, nz
+        - weight (opacity * area)
+        """
+        mkdir_p(os.path.dirname(path))
+
+        points, normals, weights, _ = self.extract_oriented_pointcloud(
+            opacity_threshold=opacity_threshold,
+            normalize_weight=normalize_weight,
+            visibility_mask=visibility_mask,
+            log_weight=log_weight,
+        )
+
+        points_np = points.detach().cpu().numpy()
+        normals_np = normals.detach().cpu().numpy()
+        weights_np = weights.detach().cpu().numpy()
+
+        # weights_np, points_np, normals_np 已存在
+        w = weights_np.astype(np.float64)
+        w_min, w_max = w.min(), w.max()
+        if w_max > w_min:
+            w_norm = (w - w_min) / (w_max - w_min)
+        else:
+            w_norm = np.zeros_like(w)
+
+        red = (w_norm * 255).astype(np.uint8)
+        green = np.zeros_like(red, dtype=np.uint8)
+        blue = np.full_like(red, 255, dtype=np.uint8)
+
+        dtype_full = [
+            ('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
+            ('nx', 'f4'), ('ny', 'f4'), ('nz', 'f4'),
+            ('weight', 'f4'),
+            ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')
+        ]
+        elements = np.empty(points_np.shape[0], dtype=dtype_full)
+        elements['x'] = points_np[:, 0]
+        elements['y'] = points_np[:, 1]
+        elements['z'] = points_np[:, 2]
+        elements['nx'] = normals_np[:, 0]
+        elements['ny'] = normals_np[:, 1]
+        elements['nz'] = normals_np[:, 2]
+        elements['weight'] = weights_np
+        elements['red'] = red
+        elements['green'] = green
+        elements['blue'] = blue
+
+        el = PlyElement.describe(elements, 'vertex')
+        PlyData([el]).write(path)
+        print(f"DEBUG: Oriented point cloud saved to {path} (N={points_np.shape[0]})")

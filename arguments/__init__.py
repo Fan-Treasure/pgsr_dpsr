@@ -116,6 +116,8 @@ class OptimizationParams(ParamGroup):
         self.max_all_points = 6000_000
         self.exposure_compensation = False
         self.random_background = False
+        
+        self.mesh_opacity_threshold = 0.05
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

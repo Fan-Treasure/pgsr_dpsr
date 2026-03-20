@@ -15,3 +15,5 @@ eval
 
 workdir/**
 outputs/**
+test/**
+output_dtu/**
