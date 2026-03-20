@@ -133,6 +133,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         normalization_mode="aabb",
         aabb_padding=0.05,
         device="cuda",
+        mesh_backend="diffmc",  # "diffmc" | "flexicubes" | "mc"
     )
 
     for iteration in range(first_iter, opt.iterations + 1):
@@ -374,21 +375,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # [NEW] 保存有向点云PLY（带权重）
             viz_path_oriented_pc = os.path.join(scene.model_path, "debug_viz", f"oriented_pointcloud_{iteration}.ply")
             gaussians.save_oriented_pointcloud_ply(viz_path_oriented_pc, opacity_threshold=opt.mesh_opacity_threshold, normalize_weight=True, visibility_mask=observe_count > 0, log_weight=True)
-
-            '''out_path = os.path.join(scene.model_path, "debug_viz", f"occ_init_mesh_{iteration}.ply")
-            res = mesh_model.export_occupancy_init_from_gaussians(
-                gaussians.get_xyz,
-                gaussians.get_rotation,
-                gaussians.get_scaling,
-                gaussians.get_opacity,
-                out_path,
-                occ_res=256,
-                opacity_threshold=opt.mesh_opacity_threshold,
-            )
-            if res is None:
-                print("DEBUG: Skip occupancy init mesh at iter 1, no gaussians after opacity mask.")
-            else:
-                print(f"DEBUG: Occupancy init mesh saved to {res['path']}, V={res['verts'].shape[0]}, F={res['faces'].shape[0]}")'''
             
             points, normals, weights, _ = gaussians.extract_oriented_pointcloud(
                 opacity_threshold=opt.mesh_opacity_threshold,

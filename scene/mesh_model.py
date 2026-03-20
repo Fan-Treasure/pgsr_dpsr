@@ -10,11 +10,16 @@ from utils.system_utils import mkdir_p
 from diso import DiffMC
 from utils.mesh_utils import get_opacity_field_from_gaussians
 
+try:
+    import kaolin as kal
+except ImportError:
+    kal = None
+
 SMALL_NUMBER = 1e-6
 
 
 class MeshModel:
-    """Wrap DPSR + DiffMC for one-shot mesh extraction from oriented point clouds."""
+    """Wrap DPSR + meshing backends for one-shot mesh extraction from oriented point clouds."""
 
     def __init__(
         self,
@@ -25,9 +30,11 @@ class MeshModel:
         normalization_mode="aabb",
         aabb_padding=0.05,
         device="cuda",
+        mesh_backend="diffmc",
     ):
         self.device = device
         self.grid_res = grid_res
+        self.mesh_backend = str(mesh_backend).lower()
         self.dpsr = DPSR(res=(grid_res, grid_res, grid_res), sig=dpsr_sig).to(device)
         self.density_thres = torch.tensor([density_thres], dtype=torch.float32, device=device)
         self.normalization_mode = normalization_mode
@@ -47,6 +54,83 @@ class MeshModel:
         )
 
         self.diffmc = DiffMC(dtype=torch.float32).to(device)
+        self.flexicubes_engine = None
+        self.flexi_cached_res = None
+        self.flexi_cached_vertices = None
+        self.flexi_cached_cube_idx = None
+
+    def _ensure_flexicubes_grid(self, grid_dim):
+        if self.flexi_cached_res == grid_dim:
+            return self.flexi_cached_vertices, self.flexi_cached_cube_idx
+
+        # Vertex coordinates on [0, 1]^3, matching DPSR normalized domain.
+        axis = torch.linspace(0.0, 1.0, steps=grid_dim, device=self.device, dtype=torch.float32)
+        gx, gy, gz = torch.meshgrid(axis, axis, axis, indexing="ij")
+        voxelgrid_vertices = torch.stack([gx, gy, gz], dim=-1).reshape(-1, 3)
+
+        vid = torch.arange(grid_dim ** 3, device=self.device, dtype=torch.long).reshape(grid_dim, grid_dim, grid_dim)
+        cube_idx = torch.stack(
+            [
+                vid[:-1, :-1, :-1],
+                vid[1:, :-1, :-1],
+                vid[1:, 1:, :-1],
+                vid[:-1, 1:, :-1],
+                vid[:-1, :-1, 1:],
+                vid[1:, :-1, 1:],
+                vid[1:, 1:, 1:],
+                vid[:-1, 1:, 1:],
+            ],
+            dim=-1,
+        ).reshape(-1, 8)
+
+        self.flexi_cached_res = grid_dim
+        self.flexi_cached_vertices = voxelgrid_vertices
+        self.flexi_cached_cube_idx = cube_idx
+        return voxelgrid_vertices, cube_idx
+
+    def _extract_mesh_flexicubes(self, psr, isovalue=0.0):
+        if self.flexicubes_engine is None:
+            self.flexicubes_engine = kal.ops.conversions.FlexiCubes(device=self.device)
+
+        grid_dim = int(psr.shape[0])
+        if psr.ndim != 3 or psr.shape[1] != grid_dim or psr.shape[2] != grid_dim:
+            raise ValueError(f"FlexiCubes expects cubic [D,D,D] field, got shape={tuple(psr.shape)}")
+
+        voxelgrid_vertices, cube_idx = self._ensure_flexicubes_grid(grid_dim)
+        #scalar_field = (psr - float(isovalue)).reshape(-1).to(torch.float32)
+        import torch.nn.functional as F
+
+        D = psr.shape[0]
+        # 1) 构造要在其上采样的顶点坐标（[0,1]^3 -> grid_sample expects [-1,1]）
+        axis = torch.linspace(0.0, 1.0, steps=D, device=psr.device, dtype=torch.float32)
+        gx, gy, gz = torch.meshgrid(axis, axis, axis, indexing='ij')
+        grid = torch.stack([gx, gy, gz], dim=-1)  # (D,D,D,3)
+        grid = 2.0 * grid - 1.0  # to [-1,1] for grid_sample
+
+        # 2) 使用 grid_sample 做三线性重采样（输入形状 NCDHW for 3D: (1,1,D,D,D)）
+        psr_in = psr[None, None]  # (1,1,D,D,D)
+        vertex_psr = F.grid_sample(psr_in, grid[None], mode='bilinear', padding_mode='border', align_corners=True)
+        vertex_psr = vertex_psr[0,0]  # (D,D,D)
+        
+        # 3) 可选：简单平滑（3D 均值）以去噪
+        kernel = torch.ones((1,1,3,3,3), device=psr.device) / 27.0
+        vertex_psr_pad = vertex_psr[None,None, None]  # expand dims
+        # 使用 conv3d: (N,C,D,H,W)
+        vertex_psr_smooth = F.conv3d(vertex_psr_pad, kernel, padding=1)[0,0]
+
+        out = self.flexicubes_engine(
+            voxelgrid_vertices=voxelgrid_vertices,
+            scalar_field=scalar_field,
+            cube_idx=cube_idx,
+            resolution=grid_dim - 1,
+        )
+
+        if isinstance(out, tuple):
+            verts, faces = out[0], out[1]
+        else:
+            raise RuntimeError("Unexpected FlexiCubes return type")
+
+        return verts.to(torch.float32), faces.to(torch.int32)
 
     def _get_normalization_params(self, points_world):
         if self.normalization_mode == "aabb":
@@ -84,14 +168,20 @@ class MeshModel:
         return psr.squeeze(0), center, half_extent
 
     def _extract_mesh(self, psr):
-        if self.diffmc is not None:
+        if self.mesh_backend == "diffmc":
             verts, faces = self.diffmc(psr, deform=None, isovalue=0.0)
             verts = verts.to(torch.float32)
             faces = faces.to(torch.int32)
             return verts, faces
 
-        verts, faces, _ = mc_from_psr(psr.unsqueeze(0), pytorchify=True, real_scale=False)
-        return verts.to(torch.float32), faces.to(torch.int32)
+        if self.mesh_backend == "flexicubes":
+            return self._extract_mesh_flexicubes(psr, isovalue=0.0)
+
+        if self.mesh_backend == "mc":
+            verts, faces, _ = mc_from_psr(psr.unsqueeze(0), pytorchify=True, real_scale=False)
+            return verts.to(torch.float32), faces.to(torch.int32)
+
+        raise ValueError(f"Unknown mesh backend: {self.mesh_backend}. Use 'diffmc', 'flexicubes', or 'mc'.")
 
     def _to_world(self, verts, center, half_extent):
         verts = (verts - 0.5) * (2.0 * half_extent) + center[None]
@@ -124,122 +214,3 @@ class MeshModel:
         ply_verts = PlyElement.describe(vertices, "vertex")
         ply_faces = PlyElement.describe(faces_el, "face")
         PlyData([ply_verts, ply_faces], text=False).write(path)
-
-    def save_psr_slices(self, path_prefix, psr, axis='z', indices=None, cmap='bwr'):
-        """Save 2D PNG slices of a PSR grid.
-
-        - `psr`: torch.Tensor with shape [D0, D1, D2] (or [1, D0, D1, D2]).
-        - `axis`: one of 'x','y','z' indicating slice orientation (z -> axis=0).
-        - `indices`: list of slice indices (if None, saves the middle slice).
-        """
-        if torch.is_tensor(psr):
-            psr_np = psr.detach().cpu().numpy().squeeze()
-        else:
-            psr_np = np.array(psr)
-
-        if psr_np.ndim == 4 and psr_np.shape[0] == 1:
-            psr_np = psr_np[0]
-
-        axis_map = {'z': 0, 'y': 1, 'x': 2}
-        if axis not in axis_map:
-            raise ValueError("axis must be one of 'x','y','z'")
-        ax = axis_map[axis]
-
-        size = psr_np.shape[ax]
-        if indices is None:
-            indices = [size // 2]
-
-        mkdir_p(os.path.dirname(path_prefix) or '.')
-
-        vmin = float(np.nanmin(psr_np))
-        vmax = float(np.nanmax(psr_np))
-        # choose symmetric range around zero if that seems reasonable
-        absmax = max(abs(vmin), abs(vmax))
-
-        for idx in indices:
-            if ax == 0:
-                img = psr_np[idx, :, :]
-            elif ax == 1:
-                img = psr_np[:, idx, :]
-            else:
-                img = psr_np[:, :, idx]
-
-            out_path = f"{path_prefix}_slice_{axis}{idx}.png"
-            plt.imsave(out_path, img, cmap=cmap, vmin=-absmax, vmax=absmax)
-
-    @torch.no_grad()
-    def export_occupancy_init_from_gaussians(
-        self,
-        xyz_world: torch.Tensor,
-        rotations: torch.Tensor,
-        scalings: torch.Tensor,
-        opacities: torch.Tensor,
-        out_path: str,
-        occ_res: int = 256,
-        num_blocks: int = 16,
-        relax_ratio: float = 0.5,
-        opacity_threshold: float = 0.005,
-        bbox_scale: float = 2.0,
-        aabb_padding: float = None,
-    ):
-        """Build occupancy from Gaussians, extract mesh via DiffMC and save PLY.
-
-        Inputs are in world coordinates. This function computes a local AABB
-        normalization (center, half_extent) and maps Gaussians into the
-        canonical grid used by `get_opacity_field_from_gaussians`.
-        """
-        device = xyz_world.device
-
-        mask = (opacities.squeeze(-1) > opacity_threshold)
-        if not mask.any():
-            return None
-
-        xyz_w = xyz_world[mask]
-        rot = rotations[mask]
-        scl_w = scalings[mask]
-        opa = opacities[mask]
-
-        # compute AABB normalization (reuse mesh_model padding if not provided)
-        pad = self.aabb_padding if aabb_padding is None else aabb_padding
-        pmin = torch.min(xyz_w, dim=0).values
-        pmax = torch.max(xyz_w, dim=0).values
-        center = 0.5 * (pmin + pmax)
-        max_extent = torch.max(pmax - pmin)
-        half_extent = torch.clamp(0.5 * max_extent * (1.0 + 2.0 * pad), min=SMALL_NUMBER)
-
-        # normalize to DG-Mesh domain [-bbox_scale, bbox_scale] for occupancy builder
-        xyz_n = (xyz_w - center[None]) / half_extent * bbox_scale
-        scl_n = scl_w / half_extent * bbox_scale
-
-        occ = get_opacity_field_from_gaussians(
-            xyz_n,
-            rot,
-            scl_n,
-            opa,
-            resolution=occ_res,
-            num_blocks=num_blocks,
-            relax_ratio=relax_ratio,
-            opacity_threshold=opacity_threshold,
-            bbox_scale=bbox_scale,
-        )
-
-        # use DiffMC to extract a coarse mesh from occupancy (occ small positive -> surface)
-        diffmc_occ = self.diffmc
-        verts01, faces = diffmc_occ(-occ.to(device), deform=None, isovalue=-0.01)
-        verts01 = verts01.to(torch.float32)
-        faces = faces.to(torch.int32)
-
-        # Map verts from [0,1] to normalized coords [-bbox_scale, bbox_scale]
-        verts_n = (verts01 - 0.5) * (2.0 * bbox_scale)
-        # Back to world space
-        verts_w = verts_n * half_extent.to(device) + center[None].to(device)
-
-        # save
-        self.save_mesh_ply(out_path, verts_w, faces)
-        return {
-            "path": out_path,
-            "verts": verts_w,
-            "faces": faces,
-            "center": center,
-            "half_extent": half_extent,
-        }
