@@ -76,11 +76,11 @@ class PipelineParams(ParamGroup):
 
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
-        self.iterations = 30_000
+        self.iterations = 20_000
         self.position_lr_init = 0.00016
         self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01
-        self.position_lr_max_steps = 30_000
+        self.position_lr_max_steps = 20_000
         self.feature_lr = 0.0025
         self.opacity_lr = 0.05
         self.scaling_lr = 0.005
@@ -96,14 +96,14 @@ class OptimizationParams(ParamGroup):
         
         self.wo_image_weight = False
         self.single_view_weight = 0.015
-        self.single_view_weight_from_iter = 7000
+        self.single_view_weight_from_iter = 0
 
         self.use_virtul_cam = False
         self.virtul_cam_prob = 0.5
         self.use_multi_view_trim = True
         self.multi_view_ncc_weight = 0.15
         self.multi_view_geo_weight = 0.03
-        self.multi_view_weight_from_iter = 7000
+        self.multi_view_weight_from_iter = 0
         self.multi_view_patch_size = 3
         self.multi_view_sample_num = 102400
         self.multi_view_pixel_noise_th = 1.0

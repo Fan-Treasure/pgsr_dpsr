@@ -7,8 +7,7 @@ from plyfile import PlyData, PlyElement
 from nvdiffrast_utils.dpsr import DPSR
 from nvdiffrast_utils.dpsr_utils import mc_from_psr
 from utils.system_utils import mkdir_p
-from diso import DiffMC
-from utils.mesh_utils import get_opacity_field_from_gaussians
+from diso import DiffMC, DiffDMC
 
 try:
     import kaolin as kal
@@ -54,83 +53,7 @@ class MeshModel:
         )
 
         self.diffmc = DiffMC(dtype=torch.float32).to(device)
-        self.flexicubes_engine = None
-        self.flexi_cached_res = None
-        self.flexi_cached_vertices = None
-        self.flexi_cached_cube_idx = None
-
-    def _ensure_flexicubes_grid(self, grid_dim):
-        if self.flexi_cached_res == grid_dim:
-            return self.flexi_cached_vertices, self.flexi_cached_cube_idx
-
-        # Vertex coordinates on [0, 1]^3, matching DPSR normalized domain.
-        axis = torch.linspace(0.0, 1.0, steps=grid_dim, device=self.device, dtype=torch.float32)
-        gx, gy, gz = torch.meshgrid(axis, axis, axis, indexing="ij")
-        voxelgrid_vertices = torch.stack([gx, gy, gz], dim=-1).reshape(-1, 3)
-
-        vid = torch.arange(grid_dim ** 3, device=self.device, dtype=torch.long).reshape(grid_dim, grid_dim, grid_dim)
-        cube_idx = torch.stack(
-            [
-                vid[:-1, :-1, :-1],
-                vid[1:, :-1, :-1],
-                vid[1:, 1:, :-1],
-                vid[:-1, 1:, :-1],
-                vid[:-1, :-1, 1:],
-                vid[1:, :-1, 1:],
-                vid[1:, 1:, 1:],
-                vid[:-1, 1:, 1:],
-            ],
-            dim=-1,
-        ).reshape(-1, 8)
-
-        self.flexi_cached_res = grid_dim
-        self.flexi_cached_vertices = voxelgrid_vertices
-        self.flexi_cached_cube_idx = cube_idx
-        return voxelgrid_vertices, cube_idx
-
-    def _extract_mesh_flexicubes(self, psr, isovalue=0.0):
-        if self.flexicubes_engine is None:
-            self.flexicubes_engine = kal.ops.conversions.FlexiCubes(device=self.device)
-
-        grid_dim = int(psr.shape[0])
-        if psr.ndim != 3 or psr.shape[1] != grid_dim or psr.shape[2] != grid_dim:
-            raise ValueError(f"FlexiCubes expects cubic [D,D,D] field, got shape={tuple(psr.shape)}")
-
-        voxelgrid_vertices, cube_idx = self._ensure_flexicubes_grid(grid_dim)
-        #scalar_field = (psr - float(isovalue)).reshape(-1).to(torch.float32)
-        import torch.nn.functional as F
-
-        D = psr.shape[0]
-        # 1) 构造要在其上采样的顶点坐标（[0,1]^3 -> grid_sample expects [-1,1]）
-        axis = torch.linspace(0.0, 1.0, steps=D, device=psr.device, dtype=torch.float32)
-        gx, gy, gz = torch.meshgrid(axis, axis, axis, indexing='ij')
-        grid = torch.stack([gx, gy, gz], dim=-1)  # (D,D,D,3)
-        grid = 2.0 * grid - 1.0  # to [-1,1] for grid_sample
-
-        # 2) 使用 grid_sample 做三线性重采样（输入形状 NCDHW for 3D: (1,1,D,D,D)）
-        psr_in = psr[None, None]  # (1,1,D,D,D)
-        vertex_psr = F.grid_sample(psr_in, grid[None], mode='bilinear', padding_mode='border', align_corners=True)
-        vertex_psr = vertex_psr[0,0]  # (D,D,D)
-        
-        # 3) 可选：简单平滑（3D 均值）以去噪
-        kernel = torch.ones((1,1,3,3,3), device=psr.device) / 27.0
-        vertex_psr_pad = vertex_psr[None,None, None]  # expand dims
-        # 使用 conv3d: (N,C,D,H,W)
-        vertex_psr_smooth = F.conv3d(vertex_psr_pad, kernel, padding=1)[0,0]
-
-        out = self.flexicubes_engine(
-            voxelgrid_vertices=voxelgrid_vertices,
-            scalar_field=scalar_field,
-            cube_idx=cube_idx,
-            resolution=grid_dim - 1,
-        )
-
-        if isinstance(out, tuple):
-            verts, faces = out[0], out[1]
-        else:
-            raise RuntimeError("Unexpected FlexiCubes return type")
-
-        return verts.to(torch.float32), faces.to(torch.int32)
+        self.diffdmc = DiffDMC(dtype=torch.float32).to(device)
 
     def _get_normalization_params(self, points_world):
         if self.normalization_mode == "aabb":
@@ -174,14 +97,17 @@ class MeshModel:
             faces = faces.to(torch.int32)
             return verts, faces
 
-        if self.mesh_backend == "flexicubes":
-            return self._extract_mesh_flexicubes(psr, isovalue=0.0)
+        if self.mesh_backend == "diffdmc":
+            verts, faces = self.diffdmc(psr, deform=None, isovalue=0.0)
+            verts = verts.to(torch.float32)
+            faces = faces.to(torch.int32)
+            return verts, faces
 
         if self.mesh_backend == "mc":
             verts, faces, _ = mc_from_psr(psr.unsqueeze(0), pytorchify=True, real_scale=False)
             return verts.to(torch.float32), faces.to(torch.int32)
 
-        raise ValueError(f"Unknown mesh backend: {self.mesh_backend}. Use 'diffmc', 'flexicubes', or 'mc'.")
+        raise ValueError(f"Unknown mesh backend: {self.mesh_backend}. Use 'diffmc', 'diffdmc', or 'mc'.")
 
     def _to_world(self, verts, center, half_extent):
         verts = (verts - 0.5) * (2.0 * half_extent) + center[None]

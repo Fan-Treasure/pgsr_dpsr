@@ -118,44 +118,6 @@ def build_scaling_rotation(s, r):
     L = R @ L
     return L
 
-
-def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
-    """Build 3D Gaussian covariance (symmetric 3x3) parameterized as 6D vector.
-
-    Args:
-        scaling: [N, 3] axis-aligned std/scales in local frame.
-        scaling_modifier: scalar multiplier.
-        rotation: [N, 4] quaternion.
-
-    Returns:
-        covs: [N, 6] symmetric covariance representation.
-    """
-    L = build_scaling_rotation(scaling_modifier * scaling, rotation)  # R @ S
-    actual_covariance = L @ L.transpose(1, 2)
-    return strip_symmetric(actual_covariance)
-
-
-def gaussian_3d_coeff(xyzs, covs):
-    # xyzs: [N, 3]
-    # covs: [N, 6]
-    x, y, z = xyzs[:, 0], xyzs[:, 1], xyzs[:, 2]
-    a, b, c, d, e, f = covs[:, 0], covs[:, 1], covs[:, 2], covs[:, 3], covs[:, 4], covs[:, 5]
-
-    # eps must be small enough !!!
-    inv_det = 1 / (a * d * f + 2 * e * c * b - e**2 * a - c**2 * d - b**2 * f + 1e-24)
-    inv_a = (d * f - e**2) * inv_det
-    inv_b = (e * c - b * f) * inv_det
-    inv_c = (e * b - c * d) * inv_det
-    inv_d = (a * f - c**2) * inv_det
-    inv_e = (b * c - e * a) * inv_det
-    inv_f = (a * d - b**2) * inv_det
-
-    power = -0.5 * (x**2 * inv_a + y**2 * inv_d + z**2 * inv_f) - x * y * inv_b - x * z * inv_c - y * z * inv_e
-
-    power[power > 0] = -1e10 # abnormal values... make weights 0
-        
-    return torch.exp(power)
-
 def safe_state(silent):
     old_f = sys.stdout
     class F:

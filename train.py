@@ -30,6 +30,7 @@ from arguments import ModelParams, PipelineParams, OptimizationParams
 from scene.app_model import AppModel
 from scene.cameras import Camera
 from scene.mesh_model import MeshModel
+from mesh_renderer import render as render_mesh_normal_depth
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -96,6 +97,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
+
+    mesh_init_path = os.path.join(dataset.source_path, "mesh_init.ply")
+    if os.path.exists(mesh_init_path):
+        print(f"Using mesh-based Gaussian initialization: {mesh_init_path}")
+        gaussians.create_from_mesh(
+            mesh_path=mesh_init_path,
+            spatial_lr_scale=scene.cameras_extent,
+            flatten_ratio=0.12,
+            tangent_scale=0.55,
+            opacity_init=0.10,
+            min_scale_ratio=1e-4,
+            max_scale_ratio=0.05,
+        )
+    else:
+        print(f"mesh_init.ply not found at {mesh_init_path}, fallback to COLMAP point cloud initialization.")
+
     gaussians.training_setup(opt)
 
     app_model = AppModel()
@@ -119,6 +136,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_multi_view_geo_for_log = 0.0
     ema_multi_view_pho_for_log = 0.0
     normal_loss, geo_loss, ncc_loss = None, None, None
+    saved_mesh_normal = None
+    saved_mesh_depth = None
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     debug_path = os.path.join(scene.model_path, "debug")
@@ -131,27 +150,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         density_thres=0.0,
         nerf_normalization=scene.nerf_normalization,
         normalization_mode="aabb",
-        aabb_padding=0.05,
+        aabb_padding=0,
         device="cuda",
-        mesh_backend="diffmc",  # "diffmc" | "flexicubes" | "mc"
+        mesh_backend="diffdmc",  # "diffmc" | "diffdmc" | "mc"
     )
 
     for iteration in range(first_iter, opt.iterations + 1):
-        # if network_gui.conn == None:
-        #     network_gui.try_connect()
-        # while network_gui.conn != None:
-        #     try:
-        #         net_image_bytes = None
-        #         custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
-        #         if custom_cam != None:
-        #             net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
-        #             net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
-        #         network_gui.send(net_image_bytes, dataset.source_path)
-        #         if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
-        #             break
-        #     except Exception as e:
-        #         network_gui.conn = None
-
         iter_start.record()
         gaussians.update_learning_rate(iteration)
         # Every 1000 its we increase the levels of SH up to a maximum degree
@@ -187,6 +191,58 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 observe_count = torch.zeros((gaussians.get_xyz.shape[0],), dtype=torch.bool, device="cuda")
             gaussians.add_view_dir_stat(viewpoint_cam.camera_center, visibility_filter)
             observe_count |= visibility_filter
+        
+        if (iteration == 200):
+            # 每100次进行拓扑更新 (Update Spatial Index)
+            #viz_path = os.path.join(scene.model_path, "debug_viz", f"view_dirs_{iteration}.ply")
+            #gaussians.save_view_dir_viz(viz_path)
+            # [NEW] 保存有向点云PLY（带权重）
+            debug_viz_path = os.path.join(scene.model_path, "debug_viz")
+            os.makedirs(debug_viz_path, exist_ok=True)
+            viz_path_oriented_pc = os.path.join(scene.model_path, "debug_viz", f"oriented_pointcloud_{iteration}.ply")
+            gaussians.save_oriented_pointcloud_ply(viz_path_oriented_pc, opacity_threshold=opt.mesh_opacity_threshold, normalize_weight=True, visibility_mask=observe_count > 0, log_weight=True)
+            
+            points, normals, weights, _ = gaussians.extract_oriented_pointcloud(
+                opacity_threshold=opt.mesh_opacity_threshold,
+                normalize_weight=True,
+                visibility_mask=observe_count > 0,
+                log_weight=False,
+            )
+            
+            mesh_out = mesh_model.reconstruct(points, normals, weights)
+            mesh_path = os.path.join(scene.model_path, "debug_viz", f"dpsr_diffmc_mesh_{iteration}.ply")
+            mesh_model.save_mesh_ply(mesh_path, mesh_out["verts"], mesh_out["faces"])
+            print(f"DEBUG: DPSR+DiffMC mesh saved to {mesh_path}, V={mesh_out['verts'].shape[0]}, F={mesh_out['faces'].shape[0]}")
+
+            # 用导出的 mesh 渲染法线图和深度图（不依赖 UV/纹理）
+            mesh_render_pkg = render_mesh_normal_depth(viewpoint_cam, mesh_out["verts"], mesh_out["faces"])
+            mesh_alpha = mesh_render_pkg["rend_alpha"]
+            mesh_normal = mesh_render_pkg["rend_normal"]
+            mesh_depth = mesh_render_pkg["rend_depth"]
+            alpha_mask = (mesh_alpha > 1e-4)
+
+            normal_vis = ((mesh_normal + 1.0) * 0.5).clamp(0.0, 1.0)
+            # mask out background (mesh_alpha has shape [1,H,W])
+            normal_vis[:, ~alpha_mask[0]] = 0.0
+            normal_vis_u8 = (normal_vis.detach().cpu().numpy() * 255).astype(np.uint8)
+            # CHW -> HWC
+            normal_vis_hwc = np.transpose(normal_vis_u8, (1, 2, 0))
+            normal_vis_bgr = normal_vis_hwc[:, :, [2, 1, 0]]
+
+            depth_np = mesh_depth[0].detach().cpu().numpy()
+            alpha_np = alpha_mask[0].detach().cpu().numpy()
+            depth_vis = np.zeros_like(depth_np, dtype=np.uint8)
+            if np.any(alpha_np):
+                d_valid = depth_np[alpha_np]
+                d_min, d_max = d_valid.min(), d_valid.max()
+                depth_norm = np.zeros_like(depth_np, dtype=np.float32)
+                depth_norm[alpha_np] = (d_valid - d_min) / (d_max - d_min + 1e-20)
+                depth_vis = (depth_norm * 255).clip(0, 255).astype(np.uint8)
+            depth_color = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
+            depth_color[~alpha_np] = 0
+            # cache for mosaic
+            saved_mesh_normal = normal_vis_bgr
+            saved_mesh_depth = depth_color
         
         # Loss
         ssim_loss = (1.0 - ssim(image, gt_image))
@@ -293,9 +349,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     geo_loss_map[d_mask_np] = (valid_vals - min_v) / (max_v - min_v + 1e-20)
                     geo_loss_map = (geo_loss_map * 255).astype(np.uint8)
                     geo_loss_color = cv2.applyColorMap(geo_loss_map, cv2.COLORMAP_JET)
+                    # 第一行：左->右 = 真实图像（gt_img_show）、渲染结果（img_show）、渲染法线可视化（normal_show）、渲染距离热图（distance_color）
                     row0 = np.concatenate([gt_img_show, img_show, normal_show, distance_color], axis=1)
+                    # 第二行：左->右 = 几何一致性/权重掩码（d_mask_show_color）、参考深度热图（depth_color）、深度法线可视化（depth_normal_show）、像素权重热图（image_weight_color）
                     row1 = np.concatenate([d_mask_show_color, depth_color, depth_normal_show, image_weight_color], axis=1)
-                    row2 = np.concatenate([geo_loss_color, geo_loss_color, geo_loss_color, geo_loss_color], axis=1)
+                    # 第三行：优先显示 mesh 渲染的法线/深度（若已缓存），否则回退到多张几何损失热图（geo_loss_color）
+                    if saved_mesh_normal is not None and saved_mesh_depth is not None:
+                        row2 = np.concatenate([geo_loss_color, saved_mesh_depth, saved_mesh_normal, saved_mesh_depth], axis=1)
+                    else:
+                        row2 = np.concatenate([geo_loss_color, geo_loss_color, geo_loss_color, geo_loss_color], axis=1)
                     image_to_show = np.concatenate([row0, row1, row2], axis=0)
                     cv2.imwrite(os.path.join(debug_path, "%05d"%iteration + "_" + viewpoint_cam.image_name + ".jpg"), image_to_show)
 
@@ -364,31 +426,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         loss.backward()
         iter_end.record()
-
-        if (iteration == 8000):
-            # 每100次进行拓扑更新 (Update Spatial Index)
-            #viz_path = os.path.join(scene.model_path, "debug_viz", f"view_dirs_{iteration}.ply")
-            #gaussians.save_view_dir_viz(viz_path)
-            # [2] 保存修正后的几何法线 (应该和上面大致同向)
-            viz_path_norm = os.path.join(scene.model_path, "debug_viz", f"oriented_normals_{iteration}.ply")
-            gaussians.save_oriented_normal_viz(viz_path_norm, opacity_threshold=opt.mesh_opacity_threshold)
-            # [NEW] 保存有向点云PLY（带权重）
-            viz_path_oriented_pc = os.path.join(scene.model_path, "debug_viz", f"oriented_pointcloud_{iteration}.ply")
-            gaussians.save_oriented_pointcloud_ply(viz_path_oriented_pc, opacity_threshold=opt.mesh_opacity_threshold, normalize_weight=True, visibility_mask=observe_count > 0, log_weight=True)
-            
-            points, normals, weights, _ = gaussians.extract_oriented_pointcloud(
-                opacity_threshold=opt.mesh_opacity_threshold,
-                normalize_weight=True,
-                visibility_mask=observe_count > 0,
-                log_weight=False,
-            )
-            if points.shape[0] > 0:
-                mesh_out = mesh_model.reconstruct(points, normals, weights)
-                mesh_path = os.path.join(scene.model_path, "debug_viz", f"dpsr_diffmc_mesh_{iteration}.ply")
-                mesh_model.save_mesh_ply(mesh_path, mesh_out["verts"], mesh_out["faces"])
-                print(f"DEBUG: DPSR+DiffMC mesh saved to {mesh_path}, V={mesh_out['verts'].shape[0]}, F={mesh_out['faces'].shape[0]}")
-            else:
-                print("DEBUG: Skip DPSR+DiffMC at iter 8000, no points after mask.")
 
         if iteration % 100 == 0:
             observe_count.zero_()

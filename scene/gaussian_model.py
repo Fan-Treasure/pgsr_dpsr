@@ -20,7 +20,7 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
-from pytorch3d.transforms import quaternion_to_matrix
+from pytorch3d.transforms import quaternion_to_matrix, matrix_to_quaternion
 
 def dilate(bin_img, ksize=5):
     pad = (ksize - 1) // 2
@@ -193,6 +193,133 @@ class GaussianModel:
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
+        self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.max_weight = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+    def create_from_mesh(
+        self,
+        mesh_path: str,
+        spatial_lr_scale: float,
+        flatten_ratio: float = 0.12,
+        tangent_scale: float = 0.55,
+        opacity_init: float = 0.10,
+        min_scale_ratio: float = 1e-4,
+        max_scale_ratio: float = 0.05,
+    ):
+        """Initialize one Gaussian per mesh face using face centroids and normals."""
+        self.spatial_lr_scale = spatial_lr_scale
+
+        ply = PlyData.read(mesh_path)
+        if "face" not in ply:
+            raise ValueError(f"Mesh file has no face element: {mesh_path}")
+
+        verts = np.stack(
+            [
+                np.asarray(ply["vertex"]["x"], dtype=np.float32),
+                np.asarray(ply["vertex"]["y"], dtype=np.float32),
+                np.asarray(ply["vertex"]["z"], dtype=np.float32),
+            ],
+            axis=1,
+        )
+        faces_raw = np.asarray(ply["face"].data["vertex_indices"])
+        faces = np.stack([np.asarray(f, dtype=np.int64) for f in faces_raw], axis=0)
+        if faces.shape[1] != 3:
+            raise ValueError(f"Only triangular faces are supported, got face size {faces.shape[1]}")
+
+        has_color = all(c in ply["vertex"].data.dtype.names for c in ["red", "green", "blue"])
+        if has_color:
+            vcols = np.stack(
+                [
+                    np.asarray(ply["vertex"]["red"], dtype=np.float32),
+                    np.asarray(ply["vertex"]["green"], dtype=np.float32),
+                    np.asarray(ply["vertex"]["blue"], dtype=np.float32),
+                ],
+                axis=1,
+            ) / 255.0
+        else:
+            vcols = np.full((verts.shape[0], 3), 0.5, dtype=np.float32)
+
+        v0 = verts[faces[:, 0]]
+        v1 = verts[faces[:, 1]]
+        v2 = verts[faces[:, 2]]
+        centroids = (v0 + v1 + v2) / 3.0
+
+        e01 = v1 - v0
+        e02 = v2 - v0
+        n = np.cross(e01, e02)
+        n_norm = np.linalg.norm(n, axis=1, keepdims=True)
+        valid = n_norm[:, 0] > 1e-12
+        if valid.sum() == 0:
+            raise ValueError(f"All mesh faces are degenerate in {mesh_path}")
+
+        n = n[valid] / np.clip(n_norm[valid], 1e-12, None)
+        centroids = centroids[valid]
+        faces_valid = faces[valid]
+
+        t1 = e01[valid]
+        t1_norm = np.linalg.norm(t1, axis=1, keepdims=True)
+        fallback_mask = t1_norm[:, 0] <= 1e-12
+        t1 = t1 / np.clip(t1_norm, 1e-12, None)
+        if np.any(fallback_mask):
+            t1[fallback_mask] = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+
+        t2 = np.cross(n, t1)
+        t2 = t2 / np.clip(np.linalg.norm(t2, axis=1, keepdims=True), 1e-12, None)
+
+        # Re-orthogonalize tangent basis for numerical stability.
+        t1 = np.cross(t2, n)
+        t1 = t1 / np.clip(np.linalg.norm(t1, axis=1, keepdims=True), 1e-12, None)
+
+        p0 = v0[valid] - centroids
+        p1 = v1[valid] - centroids
+        p2 = v2[valid] - centroids
+
+        u0 = np.abs(np.sum(p0 * t1, axis=1))
+        u1 = np.abs(np.sum(p1 * t1, axis=1))
+        u2 = np.abs(np.sum(p2 * t1, axis=1))
+        v0p = np.abs(np.sum(p0 * t2, axis=1))
+        v1p = np.abs(np.sum(p1 * t2, axis=1))
+        v2p = np.abs(np.sum(p2 * t2, axis=1))
+
+        span_u = np.maximum(np.maximum(u0, u1), u2)
+        span_v = np.maximum(np.maximum(v0p, v1p), v2p)
+
+        scene_scale = max(float(spatial_lr_scale), 1e-6)
+        min_scale = scene_scale * float(min_scale_ratio)
+        max_scale = scene_scale * float(max_scale_ratio)
+
+        su = np.clip(float(tangent_scale) * span_u, min_scale, max_scale)
+        sv = np.clip(float(tangent_scale) * span_v, min_scale, max_scale)
+        sn = np.clip(float(flatten_ratio) * np.minimum(su, sv), min_scale * 0.5, max_scale)
+
+        rot_mats = np.stack([t1, t2, n], axis=-1).astype(np.float32)  # [N, 3, 3]
+        rotations = matrix_to_quaternion(torch.from_numpy(rot_mats).cuda())
+
+        face_colors = (
+            vcols[faces_valid[:, 0]] + vcols[faces_valid[:, 1]] + vcols[faces_valid[:, 2]]
+        ) / 3.0
+
+        fused_point_cloud = torch.tensor(centroids, dtype=torch.float32, device="cuda")
+        fused_color = RGB2SH(torch.tensor(face_colors, dtype=torch.float32, device="cuda"))
+        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2), dtype=torch.float32, device="cuda")
+        features[:, :3, 0] = fused_color
+
+        scales_xyz = np.stack([su, sv, sn], axis=1).astype(np.float32)
+        scales = torch.log(torch.tensor(scales_xyz, dtype=torch.float32, device="cuda"))
+
+        opacity_init = float(np.clip(opacity_init, 1e-4, 0.999))
+        opacities = inverse_sigmoid(opacity_init * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float32, device="cuda"))
+
+        print(f"Number of points from mesh initialisation : {fused_point_cloud.shape[0]}")
+
+        knn_f = torch.randn((fused_point_cloud.shape[0], 6), dtype=torch.float32, device="cuda")
+        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
+        self._knn_f = nn.Parameter(knn_f.requires_grad_(True))
+        self._features_dc = nn.Parameter(features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._scaling = nn.Parameter(scales.requires_grad_(True))
+        self._rotation = nn.Parameter(rotations.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self.max_weight = torch.zeros((self.get_xyz.shape[0]), device="cuda")
@@ -661,56 +788,6 @@ class GaussianModel:
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
         print(f"DEBUG: View direction visualization saved to {path}")
-
-    # [NEW] 导出修正后的法线 (Oriented Normals)
-    def save_oriented_normal_viz(self, path, opacity_threshold=0.0):
-        """
-        导出 PLY 用于调试：
-        - 顶点位置: 高斯中心
-        - 顶点法线: 修正后的法线
-        - 顶点颜色: 将修正后的法线映射到颜色空间
-        """
-        mkdir_p(os.path.dirname(path))
-
-        # 1. 准备数据
-        xyz = self._xyz.detach().cpu().numpy()
-        opacities = self.get_opacity.detach().cpu().numpy()
-        
-        # 2. 修正法线
-        if self.view_dir_accumulation is not None:
-            normals_tensor = self.get_oriented_normal().detach()
-            normals = normals_tensor.cpu().numpy()
-        else:
-            normals = np.zeros_like(xyz)
-
-        # 3. 筛选不透明度
-        mask = (opacities.squeeze() > opacity_threshold)
-        xyz = xyz[mask]
-        normals = normals[mask]
-
-        # 将法线映射到 0-1 颜色空间
-        colors = (normals + 1) / 2.0
-        
-        # 构造 PLY 数据
-        dtype_full = [('x', 'f4'), ('y', 'f4'), ('z', 'f4'), 
-                      ('nx', 'f4'), ('ny', 'f4'), ('nz', 'f4'), 
-                      ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')]
-        
-        elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        
-        elements['x'] = xyz[:, 0]
-        elements['y'] = xyz[:, 1]
-        elements['z'] = xyz[:, 2]
-        elements['nx'] = normals[:, 0]
-        elements['ny'] = normals[:, 1]
-        elements['nz'] = normals[:, 2]
-        elements['red'] = (colors[:, 0] * 255).astype(np.uint8)
-        elements['green'] = (colors[:, 1] * 255).astype(np.uint8)
-        elements['blue'] = (colors[:, 2] * 255).astype(np.uint8)
-        
-        el = PlyElement.describe(elements, 'vertex')
-        PlyData([el]).write(path)
-        print(f"DEBUG: Oriented norms saved to {path} (Th={opacity_threshold}, N={xyz.shape[0]})")
 
     def extract_oriented_pointcloud(self, opacity_threshold=0.0, normalize_weight=True, visibility_mask=None, log_weight=False):
         """
