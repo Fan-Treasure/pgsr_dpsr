@@ -45,11 +45,11 @@ def render(viewpoint_camera, verts_world: torch.Tensor, faces: torch.Tensor):
     输出:
         rend_alpha: (1, H, W)
         rend_normal: (3, H, W) 世界坐标法线
-        rend_depth: (1, H, W) 视空间深度（取 |z|）
+        rend_depth: (H, W) 视空间深度（取 |z|）
     """
     H, W = int(viewpoint_camera.image_height), int(viewpoint_camera.image_width)
-    view = viewpoint_camera.world_view_transform
-    proj = viewpoint_camera.projection_matrix
+    view = viewpoint_camera.world_view_transform.transpose(0, 1)
+    proj = viewpoint_camera.projection_matrix.transpose(0, 1)
     
     # Convert camera MVP from D3D/GS NDC (z∈[0,1]) to OpenGL NDC (z∈[-1,1])
     proj_glndc = proj.clone()
@@ -103,6 +103,6 @@ def render(viewpoint_camera, verts_world: torch.Tensor, faces: torch.Tensor):
     return {
         "rend_alpha": alpha_aa,           # (1,H,W)
         "rend_normal": rend_normal,    # (3,H,W)
-        "rend_depth": phys_depth,      # (1,H,W) 
+        "rend_depth": phys_depth,      # (H,W) 
     }
  

@@ -214,35 +214,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             mesh_model.save_mesh_ply(mesh_path, mesh_out["verts"], mesh_out["faces"])
             print(f"DEBUG: DPSR+DiffMC mesh saved to {mesh_path}, V={mesh_out['verts'].shape[0]}, F={mesh_out['faces'].shape[0]}")
 
-            # 用导出的 mesh 渲染法线图和深度图（不依赖 UV/纹理）
+            # 用导出的 mesh 渲染法线图和深度图
             mesh_render_pkg = render_mesh_normal_depth(viewpoint_cam, mesh_out["verts"], mesh_out["faces"])
             mesh_alpha = mesh_render_pkg["rend_alpha"]
             mesh_normal = mesh_render_pkg["rend_normal"]
-            mesh_depth = mesh_render_pkg["rend_depth"]
+            mesh_depth = mesh_render_pkg["rend_depth"].squeeze(0)
             alpha_mask = (mesh_alpha > 1e-4)
 
-            normal_vis = ((mesh_normal + 1.0) * 0.5).clamp(0.0, 1.0)
-            # mask out background (mesh_alpha has shape [1,H,W])
-            normal_vis[:, ~alpha_mask[0]] = 0.0
-            normal_vis_u8 = (normal_vis.detach().cpu().numpy() * 255).astype(np.uint8)
-            # CHW -> HWC
-            normal_vis_hwc = np.transpose(normal_vis_u8, (1, 2, 0))
-            normal_vis_bgr = normal_vis_hwc[:, :, [2, 1, 0]]
+            # mesh normal -> same format as normal_show (H,W,3) uint8
+            rend_normal_t = ((mesh_normal + 1.0) * 0.5).permute(1, 2, 0).clamp(0, 1)
+            rend_normal_show = (rend_normal_t * 255).detach().cpu().numpy().astype(np.uint8)
 
-            depth_np = mesh_depth[0].detach().cpu().numpy()
-            alpha_np = alpha_mask[0].detach().cpu().numpy()
-            depth_vis = np.zeros_like(depth_np, dtype=np.uint8)
-            if np.any(alpha_np):
-                d_valid = depth_np[alpha_np]
-                d_min, d_max = d_valid.min(), d_valid.max()
-                depth_norm = np.zeros_like(depth_np, dtype=np.float32)
-                depth_norm[alpha_np] = (d_valid - d_min) / (d_max - d_min + 1e-20)
-                depth_vis = (depth_norm * 255).clip(0, 255).astype(np.uint8)
-            depth_color = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
-            depth_color[~alpha_np] = 0
+            # mesh depth -> single-channel -> apply colormap like depth_color
+            depth_arr = mesh_depth.squeeze().detach().cpu().numpy()
+            d_min, d_max = depth_arr.min(), depth_arr.max()
+            if d_max - d_min > 1e-20:
+                depth_norm = (depth_arr - d_min) / (d_max - d_min)
+            else:
+                depth_norm = np.zeros_like(depth_arr)
+            depth_u8 = (depth_norm * 255).clip(0, 255).astype(np.uint8)
+            rend_depth_show = cv2.applyColorMap(depth_u8, cv2.COLORMAP_JET)
             # cache for mosaic
-            saved_mesh_normal = normal_vis_bgr
-            saved_mesh_depth = depth_color
+            saved_mesh_normal = rend_normal_show
+            saved_mesh_depth = rend_depth_show
         
         # Loss
         ssim_loss = (1.0 - ssim(image, gt_image))
@@ -355,7 +349,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     row1 = np.concatenate([d_mask_show_color, depth_color, depth_normal_show, image_weight_color], axis=1)
                     # 第三行：优先显示 mesh 渲染的法线/深度（若已缓存），否则回退到多张几何损失热图（geo_loss_color）
                     if saved_mesh_normal is not None and saved_mesh_depth is not None:
-                        row2 = np.concatenate([geo_loss_color, saved_mesh_depth, saved_mesh_normal, saved_mesh_depth], axis=1)
+                        row2 = np.concatenate([geo_loss_color, saved_mesh_depth, saved_mesh_normal, saved_mesh_normal], axis=1)
                     else:
                         row2 = np.concatenate([geo_loss_color, geo_loss_color, geo_loss_color, geo_loss_color], axis=1)
                     image_to_show = np.concatenate([row0, row1, row2], axis=0)
