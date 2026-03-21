@@ -6,4 +6,5 @@ trimesh
 scikit-image
 libigl
 kiui
+pymeshlab
 collection

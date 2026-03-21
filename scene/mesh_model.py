@@ -113,7 +113,6 @@ class MeshModel:
         verts = (verts - 0.5) * (2.0 * half_extent) + center[None]
         return verts
 
-    @torch.no_grad()
     def reconstruct(self, points_world, normals_world, weights=None):
         psr, center, half_extent = self._build_psr(points_world, normals_world, weights)
         verts, faces = self._extract_mesh(psr)

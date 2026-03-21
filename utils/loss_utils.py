@@ -139,3 +139,74 @@ def lncc(ref, nea):
     ncc = torch.mean(ncc, dim=1, keepdim=True)
     mask = (ncc < 0.9)
     return ncc, mask
+
+
+def _to_hw(depth: torch.Tensor) -> torch.Tensor:
+    if depth.ndim == 3 and depth.shape[0] == 1:
+        return depth.squeeze(0)
+    if depth.ndim == 2:
+        return depth
+    raise ValueError(f"depth must be (H,W) or (1,H,W), got {tuple(depth.shape)}")
+
+
+def _to_hwc_normal(normal: torch.Tensor) -> torch.Tensor:
+    if normal.ndim == 3 and normal.shape[0] == 3:
+        return normal.permute(1, 2, 0)
+    if normal.ndim == 3 and normal.shape[-1] == 3:
+        return normal
+    raise ValueError(f"normal must be (3,H,W) or (H,W,3), got {tuple(normal.shape)}")
+
+
+def milo_mesh_depth_loss_log(
+    mesh_depth: torch.Tensor,
+    gaussians_depth: torch.Tensor,
+    spatial_lr_scale: float,
+    raster_mask: torch.Tensor | None = None,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """MILO-style mesh depth loss (log type).
+
+    Args:
+        mesh_depth: (H,W) or (1,H,W), view-space z. Background typically 0.
+        gaussians_depth: (H,W) or (1,H,W), view-space z.
+        spatial_lr_scale: scalar normalization factor (e.g., gaussians.spatial_lr_scale).
+        raster_mask: optional (H,W) bool/float mask, True where mesh is rasterized.
+    """
+    md = _to_hw(mesh_depth)
+    gd = _to_hw(gaussians_depth)
+    if raster_mask is None:
+        raster_mask = md > 0
+    mask = raster_mask.to(dtype=md.dtype)
+    scale = max(float(spatial_lr_scale), eps)
+    per_pix = torch.log1p((md - gd).abs() / scale) * mask
+    loss = per_pix.sum() / (mask.sum().clamp_min(1.0))
+    return loss, per_pix
+
+
+def milo_mesh_normal_loss_absdot(
+    mesh_normal_view: torch.Tensor,
+    gaussians_normal_view: torch.Tensor,
+    raster_mask: torch.Tensor | None = None,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """MILO-style mesh normal loss: 1 - |dot(n_mesh, n_gauss)|.
+
+    Args:
+        mesh_normal_view: (3,H,W) or (H,W,3) in view space.
+        gaussians_normal_view: (3,H,W) or (H,W,3) in view space.
+        raster_mask: optional (H,W) bool/float mask.
+    """
+    mn = _to_hwc_normal(mesh_normal_view)
+    gn = _to_hwc_normal(gaussians_normal_view)
+
+    mn = F.normalize(mn, dim=-1, eps=eps)
+    gn = F.normalize(gn, dim=-1, eps=eps)
+
+    dot = (mn * gn).sum(dim=-1, keepdim=False).abs()  # (H,W)
+    per_pix = (1.0 - dot)
+    if raster_mask is None:
+        raster_mask = torch.ones_like(per_pix, dtype=torch.bool)
+    mask = raster_mask.to(dtype=per_pix.dtype)
+    per_pix = per_pix * mask
+    loss = per_pix.sum() / (mask.sum().clamp_min(1.0))
+    return loss, per_pix

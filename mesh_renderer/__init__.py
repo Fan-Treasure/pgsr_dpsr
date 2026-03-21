@@ -76,22 +76,24 @@ def render(viewpoint_camera, verts_world: torch.Tensor, faces: torch.Tensor):
     depth_img = dr.antialias(depth_img, rast, pos_clip, faces)
     depth_img = depth_img.squeeze(0).squeeze(-1)  # (H, W)
 
-    # Face normals in world space, rasterized via triangle ids.
+    # Vectorized: compute per-face normals, transform to view-space, then index per-pixel once.
     face_normals = _compute_face_normals_world(verts_world, faces)  # (F, 3)
-    pix_to_face = rast[..., 3].to(torch.int64) - 1  # (1, H, W)
-    valid = pix_to_face >= 0
-    safe_idx = pix_to_face.clamp(min=0, max=max(face_normals.shape[0] - 1, 0))
+    # pix_to_face stored in rast[...,3] as (1,H,W) with +1 encoding for no-hit
+    pix_to_face = (rast[..., 3].to(torch.int64) - 1).squeeze(0)  # (H, W)
+    valid_mask = pix_to_face >= 0
 
-    normal_img = torch.zeros((1, H, W, 3), dtype=verts_world.dtype, device=device)
     if face_normals.shape[0] > 0:
-        normal_img[valid] = face_normals[safe_idx[valid]]
-    normal_img = normal_img.squeeze(0)  # (H, W, 3)
+        view_R = viewpoint_camera.world_view_transform[:3, :3]    # world->view rotation
+        face_normals_view = torch.matmul(face_normals, view_R)    # (F, 3)
+        face_normals_view = F.normalize(face_normals_view, dim=-1)
 
-    view_R = viewpoint_camera.world_view_transform[:3, :3]     # world->view rotation（按你项目的 row-vector 约定）
-    normal_view = torch.matmul(normal_img, view_R)             # (H, W, 3)
-    normal_view = torch.nn.functional.normalize(normal_view, dim=-1)
-    # 返回用 normal_view 而不是 normal_img
-    rend_normal = normal_view.permute(2, 0, 1)                 # (3, H, W)
+        safe_idx = pix_to_face.clamp(min=0, max=face_normals_view.shape[0] - 1)
+        normal_img_view = face_normals_view[safe_idx.view(-1)].view(H, W, 3)
+        normal_img_view[~valid_mask] = 0.0
+    else:
+        normal_img_view = torch.zeros((H, W, 3), dtype=verts_world.dtype, device=device)
+
+    rend_normal = normal_img_view.permute(2, 0, 1).contiguous()    # (3, H, W)
     
     return {
         "rend_alpha": alpha,

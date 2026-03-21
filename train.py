@@ -15,7 +15,14 @@ import torch
 import random
 import numpy as np
 from random import randint
-from utils.loss_utils import l1_loss, ssim, lncc, get_img_grad_weight
+from utils.loss_utils import (
+    l1_loss,
+    ssim,
+    lncc,
+    get_img_grad_weight,
+    milo_mesh_depth_loss_log,
+    milo_mesh_normal_loss_absdot,
+)
 from utils.graphics_utils import patch_offsets, patch_warp
 from gaussian_renderer import render, network_gui
 import sys, time
@@ -25,6 +32,7 @@ import cv2
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr, erode
+from utils.mesh_utils import fill_small_holes_with_pymeshlab
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from scene.app_model import AppModel
@@ -40,11 +48,11 @@ import time
 import torch.nn.functional as F
 
 def setup_seed(seed):
-     torch.manual_seed(seed)
-     torch.cuda.manual_seed_all(seed)
-     np.random.seed(seed)
-     random.seed(seed)
-     torch.backends.cudnn.deterministic = True
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
 setup_seed(22)
 
 def gen_virtul_cam(cam, trans_noise=1.0, deg_noise=15.0):
@@ -100,9 +108,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     mesh_init_path = os.path.join(dataset.source_path, "mesh_init.ply")
     if os.path.exists(mesh_init_path):
-        print(f"Using mesh-based Gaussian initialization: {mesh_init_path}")
+        repaired_mesh_path = os.path.join(dataset.model_path, "mesh_init_filled.ply")
+        fill_small_holes_with_pymeshlab(
+            input_mesh_path=mesh_init_path,
+            output_mesh_path=repaired_mesh_path,
+            max_hole_size=100,
+        )
+        mesh_for_init = repaired_mesh_path
+        print(f"Mesh hole filling done, using repaired mesh: {mesh_for_init}")
+        print(f"Using mesh-based Gaussian initialization: {mesh_for_init}")
         gaussians.create_from_mesh(
-            mesh_path=mesh_init_path,
+            mesh_path=mesh_for_init,
             spatial_lr_scale=scene.cameras_extent,
             flatten_ratio=0.12,
             tangent_scale=0.55,
@@ -135,9 +151,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_single_view_for_log = 0.0
     ema_multi_view_geo_for_log = 0.0
     ema_multi_view_pho_for_log = 0.0
-    normal_loss, geo_loss, ncc_loss = None, None, None
-    saved_mesh_normal = None
-    saved_mesh_depth = None
+    ema_mesh_normal_for_log = 0.0
+    ema_mesh_depth_for_log = 0.0
+    normal_loss, geo_loss, ncc_loss, mesh_normal_loss, mesh_depth_loss = None, None, None, None, None
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     debug_path = os.path.join(scene.model_path, "debug")
@@ -223,7 +239,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # mesh normal -> same format as normal_show (H,W,3) uint8
             rend_normal_t = ((mesh_normal + 1.0) * 0.5).permute(1, 2, 0).clamp(0, 1)
-            rend_normal_show = (rend_normal_t * 255).detach().cpu().numpy().astype(np.uint8)
+            mesh_normal_show = (rend_normal_t * 255).detach().cpu().numpy().astype(np.uint8)
 
             # mesh depth -> single-channel -> apply colormap like depth_color
             depth_arr = mesh_depth.squeeze().detach().cpu().numpy()
@@ -233,10 +249,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             else:
                 depth_norm = np.zeros_like(depth_arr)
             depth_u8 = (depth_norm * 255).clip(0, 255).astype(np.uint8)
-            rend_depth_show = cv2.applyColorMap(depth_u8, cv2.COLORMAP_JET)
-            # cache for mosaic
-            saved_mesh_normal = rend_normal_show
-            saved_mesh_depth = rend_depth_show
+            mesh_depth_show = cv2.applyColorMap(depth_u8, cv2.COLORMAP_JET)
         
         # Loss
         ssim_loss = (1.0 - ssim(image, gt_image))
@@ -254,6 +267,32 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             sorted_scale, _ = torch.sort(scale, dim=-1)
             min_scale_loss = sorted_scale[...,0]
             loss += opt.scale_loss_weight * min_scale_loss.mean()
+
+        # MILO-style mesh depth/normal losses (use gaussian rendered_normal and plane_depth)
+        if ( 'mesh_depth' in locals() and 'mesh_normal' in locals() ):
+            gauss_depth = render_pkg["plane_depth"].detach().squeeze()
+            gauss_normal = render_pkg["rendered_normal"].detach()
+            mesh_mask = (mesh_depth > 0)
+            gauss_mask = (gauss_depth > 0)
+            raster_mask = mesh_mask & gauss_mask
+            if opt.mesh_depth_weight > 0.0:
+                mesh_depth_loss, mesh_depth_map = milo_mesh_depth_loss_log(
+                    mesh_depth=mesh_depth,
+                    gaussians_depth=gauss_depth,
+                    spatial_lr_scale=gaussians.spatial_lr_scale,
+                    raster_mask=raster_mask,
+                )
+                mesh_depth_loss = opt.mesh_depth_weight * mesh_depth_loss
+                loss += mesh_depth_loss
+            if opt.mesh_normal_weight > 0.0:
+                mesh_normal_loss, mesh_normal_map = milo_mesh_normal_loss_absdot(
+                    mesh_normal_view=mesh_normal,
+                    gaussians_normal_view=gauss_normal,
+                    raster_mask=raster_mask,
+                )
+                mesh_normal_loss = opt.mesh_normal_weight * mesh_normal_loss
+                loss += mesh_normal_loss
+            
         # single-view loss
         if iteration > opt.single_view_weight_from_iter:
             weight = opt.single_view_weight
@@ -335,22 +374,37 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     image_weight = image_weight.detach().cpu().numpy()
                     image_weight = (image_weight * 255).clip(0, 255).astype(np.uint8)
                     image_weight_color = cv2.applyColorMap(image_weight, cv2.COLORMAP_JET)
-                    geo_loss_map = pixel_noise.detach().cpu().numpy().reshape(H, W)
-                    d_mask_np = d_mask.detach().cpu().numpy().reshape(H, W)
-                    geo_loss_map[~d_mask_np] = 0
-                    valid_vals = geo_loss_map[d_mask_np]
-                    min_v, max_v = valid_vals.min(), valid_vals.max()
-                    geo_loss_map[d_mask_np] = (valid_vals - min_v) / (max_v - min_v + 1e-20)
-                    geo_loss_map = (geo_loss_map * 255).astype(np.uint8)
-                    geo_loss_color = cv2.applyColorMap(geo_loss_map, cv2.COLORMAP_JET)
                     # 第一行：左->右 = 真实图像（gt_img_show）、渲染结果（img_show）、渲染法线可视化（normal_show）、渲染距离热图（distance_color）
                     row0 = np.concatenate([gt_img_show, img_show, normal_show, distance_color], axis=1)
                     # 第二行：左->右 = 几何一致性/权重掩码（d_mask_show_color）、参考深度热图（depth_color）、深度法线可视化（depth_normal_show）、像素权重热图（image_weight_color）
                     row1 = np.concatenate([d_mask_show_color, depth_color, depth_normal_show, image_weight_color], axis=1)
                     # 第三行：优先显示 mesh 渲染的法线/深度（若已缓存），否则回退到多张几何损失热图（geo_loss_color）
-                    if saved_mesh_normal is not None and saved_mesh_depth is not None:
-                        row2 = np.concatenate([geo_loss_color, saved_mesh_depth, saved_mesh_normal, saved_mesh_normal], axis=1)
+                    if 'mesh_normal_show' in locals() and 'mesh_depth_show' in locals():
+                        mesh_dmap = mesh_depth_map.detach().cpu().numpy()
+                        # 归一化（忽略未被 raster 的像素）
+                        valid = raster_mask.detach().cpu().numpy().astype(bool)
+                        v = mesh_dmap[valid]
+                        mn, mx = float(v.min()), float(v.max())
+                        norm = (mesh_dmap - mn) / max((mx - mn), 1e-8)
+                        norm_u8 = (np.clip(norm, 0.0, 1.0) * 255).astype(np.uint8)
+                        mesh_dmap_show = cv2.applyColorMap(norm_u8, cv2.COLORMAP_JET)
+                        mesh_nmap = mesh_normal_map.detach().cpu().numpy()
+                        valid = raster_mask.detach().cpu().numpy().astype(bool)
+                        v = mesh_nmap[valid]
+                        mn, mx = float(v.min()), float(v.max())
+                        norm = (mesh_nmap - mn) / max((mx - mn), 1e-8)
+                        norm_u8 = (np.clip(norm, 0.0, 1.0) * 255).astype(np.uint8)
+                        mesh_nmap_show = cv2.applyColorMap(norm_u8, cv2.COLORMAP_JET)
+                        row2 = np.concatenate([mesh_dmap_show, mesh_depth_show, mesh_normal_show, mesh_nmap_show], axis=1)
                     else:
+                        geo_loss_map = pixel_noise.detach().cpu().numpy().reshape(H, W)
+                        d_mask_np = d_mask.detach().cpu().numpy().reshape(H, W)
+                        geo_loss_map[~d_mask_np] = 0
+                        valid_vals = geo_loss_map[d_mask_np]
+                        min_v, max_v = valid_vals.min(), valid_vals.max()
+                        geo_loss_map[d_mask_np] = (valid_vals - min_v) / (max_v - min_v + 1e-20)
+                        geo_loss_map = (geo_loss_map * 255).astype(np.uint8)
+                        geo_loss_color = cv2.applyColorMap(geo_loss_map, cv2.COLORMAP_JET)
                         row2 = np.concatenate([geo_loss_color, geo_loss_color, geo_loss_color, geo_loss_color], axis=1)
                     image_to_show = np.concatenate([row0, row1, row2], axis=0)
                     cv2.imwrite(os.path.join(debug_path, "%05d"%iteration + "_" + viewpoint_cam.image_name + ".jpg"), image_to_show)
@@ -427,16 +481,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         with torch.no_grad():
             # Progress bar
             ema_loss_for_log = 0.4 * image_loss.item() + 0.6 * ema_loss_for_log
-            ema_single_view_for_log = 0.4 * normal_loss.item() if normal_loss is not None else 0.0 + 0.6 * ema_single_view_for_log
-            ema_multi_view_geo_for_log = 0.4 * geo_loss.item() if geo_loss is not None else 0.0 + 0.6 * ema_multi_view_geo_for_log
-            ema_multi_view_pho_for_log = 0.4 * ncc_loss.item() if ncc_loss is not None else 0.0 + 0.6 * ema_multi_view_pho_for_log
+            ema_single_view_for_log = (0.4 * normal_loss.item() + 0.6 * ema_single_view_for_log) if normal_loss is not None else (0.0 + 0.6 * ema_single_view_for_log)
+            ema_multi_view_geo_for_log = (0.4 * geo_loss.item() + 0.6 * ema_multi_view_geo_for_log) if geo_loss is not None else (0.0 + 0.6 * ema_multi_view_geo_for_log)
+            ema_multi_view_pho_for_log = (0.4 * ncc_loss.item() + 0.6 * ema_multi_view_pho_for_log) if ncc_loss is not None else (0.0 + 0.6 * ema_multi_view_pho_for_log)
+            ema_mesh_normal_for_log = (0.4 * mesh_normal_loss.item() + 0.6 * ema_mesh_normal_for_log) if mesh_normal_loss is not None else (0.0 + 0.6 * ema_mesh_normal_for_log)
+            ema_mesh_depth_for_log = (0.4 * mesh_depth_loss.item() + 0.6 * ema_mesh_depth_for_log) if mesh_depth_loss is not None else (0.0 + 0.6 * ema_mesh_depth_for_log)
             if iteration % 10 == 0:
                 loss_dict = {
-                    "Loss": f"{ema_loss_for_log:.{5}f}",
+                    "Img": f"{ema_loss_for_log:.{5}f}",
                     "Single": f"{ema_single_view_for_log:.{5}f}",
                     "Geo": f"{ema_multi_view_geo_for_log:.{5}f}",
                     "Pho": f"{ema_multi_view_pho_for_log:.{5}f}",
-                    "Points": f"{len(gaussians.get_xyz)}"
+                    "Points": f"{len(gaussians.get_xyz)}",
+                    "G-M_Normal": f"{ema_mesh_normal_for_log:.{5}f}",
+                    "G-M_Depth": f"{ema_mesh_depth_for_log:.{5}f}"
                 }
                 progress_bar.set_postfix(loss_dict)
                 progress_bar.update(10)
