@@ -121,8 +121,8 @@ class OptimizationParams(ParamGroup):
         self.mesh_opacity_threshold = 0.05
 
         # MILO-style mesh depth/normal regularization (only applied when mesh render is available)
-        self.mesh_depth_weight = 0.05
-        self.mesh_normal_weight = 0.05
+        self.mesh_depth_weight = 0.01
+        self.mesh_normal_weight = 0.01
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

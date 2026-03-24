@@ -23,16 +23,16 @@ from utils.loss_utils import (
     milo_mesh_depth_loss_log,
     milo_mesh_normal_loss_absdot,
 )
+from utils.graphics_utils import patch_offsets, patch_warp
 from gaussian_renderer import render, network_gui
 import sys, time
 from scene import Scene, GaussianModel
+from utils.general_utils import safe_state, freeze_gaussians_rotation
 import cv2
 import uuid
 from tqdm import tqdm
-from utils.general_utils import safe_state, freeze_gaussians_rotation
-from utils.graphics_utils import patch_offsets, patch_warp
 from utils.image_utils import psnr, erode
-from utils.mesh_utils import clean_and_repair, compute_padded_bbox_from_mesh
+from utils.mesh_utils import fill_small_holes_with_pymeshlab
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from scene.app_model import AppModel
@@ -88,7 +88,6 @@ def gen_virtul_cam(cam, trans_noise=1.0, deg_noise=15.0):
                         preload_img=False, data_device = "cuda")
     return virtul_cam
 
-
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -110,7 +109,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     mesh_init_path = os.path.join(dataset.source_path, "mesh_init.ply")
     if os.path.exists(mesh_init_path):
         repaired_mesh_path = os.path.join(dataset.model_path, "mesh_init_filled.ply")
-        clean_and_repair(
+        fill_small_holes_with_pymeshlab(
             input_mesh_path=mesh_init_path,
             output_mesh_path=repaired_mesh_path,
             max_hole_size=100,
@@ -160,29 +159,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     debug_path = os.path.join(scene.model_path, "debug")
     os.makedirs(debug_path, exist_ok=True)
     observe_count = torch.zeros((gaussians.get_xyz.shape[0],), dtype=torch.bool, device="cuda")
-    fixed_bbox_center, fixed_bbox_half_extent = compute_padded_bbox_from_mesh(mesh_for_init, padding=0.10)
     # Pre-create mesh_model to avoid repeated instantiation inside the loop
     mesh_model = MeshModel(
         grid_res=opt.grid_res_in_the_loop,
-        dpsr_sig=3.0,
+        dpsr_sig=0,
         density_thres=0,
         nerf_normalization=scene.nerf_normalization,
-        normalization_mode="fixed_aabb",
+        normalization_mode="aabb",
         aabb_padding=0,
-        fixed_aabb_center=fixed_bbox_center,
-        fixed_aabb_half_extent=fixed_bbox_half_extent,
         device="cuda",
         mesh_backend="diffdmc",  # "diffmc" | "diffdmc" | "mc"
     )
-
-    mesh_model.build_surface_prior_from_mesh(
-        mesh_for_init,
-        blur_iters=4,
-        prior_thresh=0.10,
-        prior_temp=0.05,
-        outside_value=0.5,
-    )
-    mesh_model.export_surface_prior_ply(os.path.join(scene.model_path, "surface_prior_points.ply"), threshold=0.5)
 
     for iteration in range(first_iter, opt.iterations + 1):
         iter_start.record()
@@ -259,10 +246,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # MILO-style mesh depth/normal losses (use gaussian rendered_normal and plane_depth)
         if ( 'mesh_depth' in locals() and 'mesh_normal' in locals() ):
             gauss_depth = render_pkg["plane_depth"].detach().squeeze()
-            gauss_normal = render_pkg["rendered_normal"].detach()  # depth_normal or rendered_normal
+            gauss_normal = render_pkg["rendered_normal"].detach()
             mesh_mask = (mesh_depth > 0)
             gauss_mask = (gauss_depth > 0)
-            raster_mask = mesh_mask
+            raster_mask = mesh_mask & gauss_mask
             if opt.mesh_depth_weight > 0.0:
                 mesh_depth_loss, mesh_depth_map = milo_mesh_depth_loss_log(
                     mesh_depth=mesh_depth,

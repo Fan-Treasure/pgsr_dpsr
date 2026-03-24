@@ -1,0 +1,1 @@
+Namespace(sh_degree=3, source_path='/zssd/chuanjinfan/projects/milo_2dgs/workdir/DTU/scan24', model_path='init_dtu/dtu_scan24/test', images='images', resolution=2, white_background=False, data_device='cuda', eval=False, preload_img=True, ncc_scale=0.5, multi_view_num=8, multi_view_max_angle=30, multi_view_min_dis=0.01, multi_view_max_dis=1.5)
