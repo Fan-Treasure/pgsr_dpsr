@@ -10,7 +10,6 @@
 #
 
 import os
-from datetime import datetime
 import torch
 import random
 import numpy as np
@@ -23,7 +22,7 @@ from utils.loss_utils import (
     milo_mesh_depth_loss_log,
     milo_mesh_normal_loss_absdot,
 )
-from gaussian_renderer import render, network_gui
+from gaussian_renderer import render
 import sys, time
 from scene import Scene, GaussianModel
 import cv2
@@ -116,7 +115,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             max_hole_size=100,
         )
         mesh_for_init = repaired_mesh_path
-        print(f"Mesh hole filling done, using repaired mesh: {mesh_for_init}")
         print(f"Using mesh-based Gaussian initialization: {mesh_for_init}")
         gaussians.create_from_mesh(
             mesh_path=mesh_for_init,
@@ -177,10 +175,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     mesh_model.build_surface_prior_from_mesh(
         mesh_for_init,
-        blur_iters=4,
-        prior_thresh=0.10,
+        blur_iters=4,  # blur_iters：越大，avg_pool3d 模糊越多，先验会向外“膨胀”，有效区域更大
+        prior_thresh=0.10,  # 越小，更多体素会被判为有效
         prior_temp=0.05,
-        outside_value=0.5,
+        outside_value=0.5,  
     )
     mesh_model.export_surface_prior_ply(os.path.join(scene.model_path, "surface_prior_points.ply"), threshold=0.5)
 
@@ -262,7 +260,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             gauss_normal = render_pkg["rendered_normal"].detach()  # depth_normal or rendered_normal
             mesh_mask = (mesh_depth > 0)
             gauss_mask = (gauss_depth > 0)
-            raster_mask = mesh_mask
+            raster_mask = mesh_mask & gauss_mask
             if opt.mesh_depth_weight > 0.0:
                 mesh_depth_loss, mesh_depth_map = milo_mesh_depth_loss_log(
                     mesh_depth=mesh_depth,
@@ -342,7 +340,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     weights = torch.ones_like(pixel_noise)
                     weights[~d_mask] = 0
                 
-                if iteration % 200 == 0:
+                if (iteration % 500 == 0) or ((iteration < 1000) and (iteration % 200 == 0)):
                     gt_img_show = ((gt_image).permute(1,2,0).clamp(0,1)[:,:,[2,1,0]]*255).detach().cpu().numpy().astype(np.uint8)
                     if 'app_image' in render_pkg:
                         img_show = ((render_pkg['app_image']).permute(1,2,0).clamp(0,1)[:,:,[2,1,0]]*255).detach().cpu().numpy().astype(np.uint8)

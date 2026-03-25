@@ -102,8 +102,10 @@ class MeshModel:
         outside_value=0.5,
     ):
         """Build a soft support volume from initial mesh vertices for PSR correction."""
+        # 读取初始 mesh 的顶点坐标，作为先验的几何来源
         ply = PlyData.read(mesh_path)
 
+        # 提取顶点的 x/y/z 坐标，组织成 (N, 3) 的世界坐标点云
         verts = np.stack(
             [
                 np.asarray(ply["vertex"]["x"], dtype=np.float32),
@@ -112,11 +114,12 @@ class MeshModel:
             ],
             axis=1,
         )
-
         verts_t = torch.tensor(verts, dtype=torch.float32, device=self.device)
+        # 按当前 normalization_mode 求出中心和半边长，再把顶点映射到 DPSR 的 [0,1] 坐标系
         center, half_extent = self._get_normalization_params(verts_t)
         verts_dpsr = self.normalize_points(verts_t, center, half_extent)
 
+        # 每个顶点先赋值为 1，再 rasterize 到体素网格中，形成初始的占据/支持体素场
         vals = torch.ones((1, verts_dpsr.shape[0], 1), dtype=torch.float32, device=self.device)
         prior = point_rasterize(
             verts_dpsr.unsqueeze(0),
@@ -124,21 +127,22 @@ class MeshModel:
             (self.grid_res, self.grid_res, self.grid_res),
         )[0, 0]
 
+        # 用 3D 平均池化做若干次平滑，让先验区域稍微扩展一点，避免太稀疏
         prior = prior.unsqueeze(0).unsqueeze(0)
         for _ in range(max(int(blur_iters), 0)):
             prior = F.avg_pool3d(prior, kernel_size=3, stride=1, padding=1)
         prior = prior.squeeze(0).squeeze(0)
 
+        # 再做一次最大值归一化，把先验压到 [0,1]，便于后续 sigmoid 融合
         prior_max = torch.max(prior)
         if prior_max > 0:
             prior = prior / prior_max
 
-        # 保存先验体素场，并记录用于逆归一化的参数
+        # 保存先验体素场，并记录后续导出和反归一化所需的参数
         self.surface_prior = prior.detach()
-        # 保留用于导出时把体素索引/归一化坐标转换回世界坐标的 center / half_extent
-        # 注意：center / half_extent 来自于归一化 points（上面计算时使用的值）
         self.prior_center = center.clone().detach()
         self.prior_half_extent = half_extent.clone().detach()
+        # 这些参数控制后续在 _build_psr 中如何把“有支持/无支持”的区域软融合
         self.prior_thresh = float(prior_thresh)
         self.prior_temp = max(float(prior_temp), 1e-6)
         self.prior_outside_value = float(outside_value)
