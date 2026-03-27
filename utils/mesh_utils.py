@@ -33,11 +33,7 @@ def clean_and_repair(
 
     # Basic clean-up before hole closing.
 
-    closed = _apply_filter_candidates(
-        ms,
-        ["meshing_close_holes", "close_holes"],
-        kwargs={"maxholesize": int(max_hole_size)},
-    )
+    closed = _apply_filter_candidates(ms, ["meshing_close_holes", "close_holes"], kwargs={"maxholesize": int(max_hole_size)})
     if not closed:
         raise RuntimeError("Failed to apply close_holes filter with current PyMeshLab version.")
 

@@ -173,14 +173,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         mesh_backend="diffdmc",  # "diffmc" | "diffdmc" | "mc"
     )
 
-    mesh_model.build_surface_prior_from_mesh(
-        mesh_for_init,
-        blur_iters=4,  # blur_iters：越大，avg_pool3d 模糊越多，先验会向外“膨胀”，有效区域更大
-        prior_thresh=0.10,  # 越小，更多体素会被判为有效
-        prior_temp=0.05,
-        outside_value=0.5,  
-    )
-    mesh_model.export_surface_prior_ply(os.path.join(scene.model_path, "surface_prior_points.ply"), threshold=0.5)
+    if not opt.no_surface_prior:
+        mesh_model.build_surface_prior_from_mesh(
+            mesh_for_init,
+            blur_iters=4,  # blur_iters：越大，avg_pool3d 模糊越多，先验会向外“膨胀”，有效区域更大
+            prior_thresh=0.1,  # 越小，更多体素会被判为有效
+            prior_temp=0.05,  # 越小，有效/无效区域的过渡越硬
+            outside_value=0.5,  
+        )
+        mesh_model.export_surface_prior_ply(os.path.join(scene.model_path, "surface_prior_points.ply"), threshold=0.3)
 
     for iteration in range(first_iter, opt.iterations + 1):
         iter_start.record()
@@ -256,8 +257,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # MILO-style mesh depth/normal losses (use gaussian rendered_normal and plane_depth)
         if ( 'mesh_depth' in locals() and 'mesh_normal' in locals() ):
-            gauss_depth = render_pkg["plane_depth"].detach().squeeze()
-            gauss_normal = render_pkg["rendered_normal"].detach()  # depth_normal or rendered_normal
+            gauss_depth = render_pkg["plane_depth"].squeeze()
+            gauss_normal = render_pkg["rendered_normal"]  # depth_normal or rendered_normal
+            if opt.detach_gaussian_rendering:
+                gauss_depth = gauss_depth.detach()
+                gauss_normal = gauss_normal.detach()
             mesh_mask = (mesh_depth > 0)
             gauss_mask = (gauss_depth > 0)
             raster_mask = mesh_mask & gauss_mask

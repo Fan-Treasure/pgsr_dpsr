@@ -176,10 +176,10 @@ class MeshModel:
             PlyData([ply_verts], text=False).write(path)
             return
 
-        # nz gives indices in (z, y, x) order for a (D,D,D) tensor
-        dz = nz[:, 0].to(torch.float32)
+        # torch.nonzero 返回的维度顺序与张量本身一致，这里就是 (x, y, z)
+        dx = nz[:, 0].to(torch.float32)
         dy = nz[:, 1].to(torch.float32)
-        dx = nz[:, 2].to(torch.float32)
+        dz = nz[:, 2].to(torch.float32)
         D = float(self.grid_res)
 
         # voxel center in normalized coords [0,1]
