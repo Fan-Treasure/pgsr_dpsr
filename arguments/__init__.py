@@ -121,6 +121,9 @@ class OptimizationParams(ParamGroup):
         self.detach_gaussian_rendering = False
         self.grid_res_in_the_loop = 256
         self.mesh_opacity_threshold = 0.05
+        self.view_dir_min_count = 40
+        self.view_dir_decay = 0.5
+        self.view_dir_decay_interval = 100
 
         # MILO-style mesh depth/normal regularization (only applied when mesh render is available)
         self.mesh_depth_weight = 0.05
