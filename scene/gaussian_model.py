@@ -21,6 +21,7 @@ from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from pytorch3d.transforms import quaternion_to_matrix, matrix_to_quaternion
+from pytorch3d.ops import knn_points
 
 def dilate(bin_img, ksize=5):
     pad = (ksize - 1) // 2
@@ -75,7 +76,10 @@ class GaussianModel:
         self.setup_functions()
         self.use_app = False
         self.view_dir_accumulation = None
-        self.view_dir_count = None
+        self.mesh_anchor_face_centroids = None  # 初始 mesh 所有三角面的中心点缓存
+        self.mesh_anchor_face_normals = None  # 对应三角面的单位法线缓存
+        self.mesh_anchor_cached_normals = None  # 每个高斯当前匹配到的锚点法线
+        self.mesh_anchor_cached_reliable = None  # 每个高斯的最近邻可靠性掩码
 
     def decay_view_dir_stats(self, decay: float = 0.8):
         """EMA-style forgetting for view direction stats.
@@ -84,8 +88,6 @@ class GaussianModel:
         """
         if self.view_dir_accumulation is not None:
             self.view_dir_accumulation.mul_(float(decay))
-        if self.view_dir_count is not None:
-            self.view_dir_count.mul_(float(decay))
 
     def capture(self):
         return (
@@ -506,8 +508,10 @@ class GaussianModel:
         self.max_weight = self.max_weight[valid_points_mask]
         if self.view_dir_accumulation is not None:
             self.view_dir_accumulation = self.view_dir_accumulation[valid_points_mask]
-        if self.view_dir_count is not None:
-            self.view_dir_count = self.view_dir_count[valid_points_mask]
+        if self.mesh_anchor_cached_normals is not None:
+            self.mesh_anchor_cached_normals = self.mesh_anchor_cached_normals[valid_points_mask]
+        if self.mesh_anchor_cached_reliable is not None:
+            self.mesh_anchor_cached_reliable = self.mesh_anchor_cached_reliable[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -559,12 +563,12 @@ class GaussianModel:
         if self.view_dir_accumulation is None:
             self.view_dir_accumulation = torch.zeros((self._xyz.shape[0] - new_xyz.shape[0], 3), device="cuda")
         self.view_dir_accumulation = torch.cat((self.view_dir_accumulation, new_dirs), dim=0)
-
-        # 视角统计计数（门控使用）
-        new_counts = torch.zeros((new_xyz.shape[0],), dtype=torch.float32, device="cuda")
-        if self.view_dir_count is None:
-            self.view_dir_count = torch.zeros((self._xyz.shape[0] - new_xyz.shape[0],), dtype=torch.float32, device="cuda")
-        self.view_dir_count = torch.cat((self.view_dir_count, new_counts), dim=0)
+        if self.mesh_anchor_cached_normals is not None:
+            new_anchor_normals = torch.zeros((new_xyz.shape[0], 3), device="cuda")
+            self.mesh_anchor_cached_normals = torch.cat((self.mesh_anchor_cached_normals, new_anchor_normals), dim=0)
+        if self.mesh_anchor_cached_reliable is not None:
+            new_anchor_reliable = torch.zeros((new_xyz.shape[0],), dtype=torch.bool, device="cuda")
+            self.mesh_anchor_cached_reliable = torch.cat((self.mesh_anchor_cached_reliable, new_anchor_reliable), dim=0)
 
     def densify_and_split(self, grads, grad_threshold, grads_abs, grad_abs_threshold, scene_extent, max_radii2D, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -708,6 +712,112 @@ class GaussianModel:
         T = torch.tensor(fov_camera.T).float().cuda()
         pts = (pts-T)@R.transpose(-1,-2)
         return pts
+
+    def set_mesh_normal_anchor(self, mesh_path):
+        """Load initial mesh faces as anchor candidates for normal orientation."""
+        ply = PlyData.read(mesh_path)
+        if "face" not in ply or "vertex" not in ply:
+            raise ValueError(f"Mesh must contain both face and vertex elements: {mesh_path}")
+
+        verts = np.stack(
+            [
+                np.asarray(ply["vertex"]["x"], dtype=np.float32),
+                np.asarray(ply["vertex"]["y"], dtype=np.float32),
+                np.asarray(ply["vertex"]["z"], dtype=np.float32),
+            ],
+            axis=1,
+        )
+        face_props = ply["face"].data.dtype.names
+        if not all(k in face_props for k in ("nx", "ny", "nz")):
+            raise ValueError(f"Mesh face element must contain nx/ny/nz normals: {mesh_path}")
+        faces_raw = np.asarray(ply["face"].data["vertex_indices"])
+        faces = np.stack([np.asarray(f, dtype=np.int64) for f in faces_raw], axis=0)
+        if faces.size == 0:
+            raise ValueError(f"Mesh has zero faces: {mesh_path}")
+
+        v0 = verts[faces[:, 0]]
+        v1 = verts[faces[:, 1]]
+        v2 = verts[faces[:, 2]]
+        centroids = (v0 + v1 + v2) / 3.0
+        normals = np.stack(
+            [
+                np.asarray(ply["face"]["nx"], dtype=np.float32),
+                np.asarray(ply["face"]["ny"], dtype=np.float32),
+                np.asarray(ply["face"]["nz"], dtype=np.float32),
+            ],
+            axis=1,
+        )
+        n_norm = np.linalg.norm(normals, axis=1, keepdims=True)
+        valid = n_norm[:, 0] > 1e-12
+        if valid.sum() == 0:
+            raise ValueError(f"All face normals are degenerate in: {mesh_path}")
+
+        centroids = centroids[valid]
+        normals = normals[valid] / np.clip(n_norm[valid], 1e-12, None)
+
+        device = self._xyz.device if self._xyz.numel() > 0 else "cuda"
+        self.mesh_anchor_face_centroids = torch.tensor(centroids, dtype=torch.float32, device=device)
+        self.mesh_anchor_face_normals = torch.tensor(normals, dtype=torch.float32, device=device)
+
+        n_points = int(self._xyz.shape[0])
+        self.mesh_anchor_cached_normals = torch.zeros((n_points, 3), dtype=torch.float32, device=device)
+        self.mesh_anchor_cached_reliable = torch.zeros((n_points,), dtype=torch.bool, device=device)
+        return True
+
+    def _knn_face_centroids(self, points):
+        if self.mesh_anchor_face_centroids is None or self.mesh_anchor_face_centroids.shape[0] == 0:
+            return None, None
+
+        if knn_points is not None:
+            d2, idx, _ = knn_points(points.unsqueeze(0), self.mesh_anchor_face_centroids.unsqueeze(0), K=1)
+            d = torch.sqrt(torch.clamp_min(d2[0, :, 0], 1e-12))
+            i = idx[0, :, 0]
+            return d, i
+
+        # Fallback for environments without pytorch3d.ops.knn_points.
+        n = points.shape[0]
+        nn_dist = torch.empty((n,), dtype=torch.float32, device=points.device)
+        nn_idx = torch.empty((n,), dtype=torch.long, device=points.device)
+        chunk = 4096
+        for start in range(0, n, chunk):
+            end = min(start + chunk, n)
+            dmat = torch.cdist(points[start:end], self.mesh_anchor_face_centroids)
+            d, i = torch.min(dmat, dim=1)
+            nn_dist[start:end] = d
+            nn_idx[start:end] = i
+        return nn_dist, nn_idx
+
+    @torch.no_grad()
+    def update_mesh_normal_cache(self, distance_ratio=3.0, normal_cos_thresh=0.2):
+        """Refresh per-Gaussian mesh-anchor cache and reliability mask."""
+        # 对当前高斯中心做最近邻搜索，找到初始 mesh 最近的面片中心
+        # 同时检查两个门槛：
+        # 距离是否足够近，阈值基于高斯的面内尺度，而不是最短轴厚度
+        # 当前高斯无向法线和锚点法线夹角是否不太离谱，abs(dot(raw_normal, anchor_normal)) >= normal_cos_thresh
+        if self.mesh_anchor_face_centroids is None or self._xyz.numel() == 0:
+            self.mesh_anchor_cached_normals = None
+            self.mesh_anchor_cached_reliable = None
+            return
+
+        points = self._xyz.detach()
+        raw_normal = self.get_smallest_axis().detach()
+        nn_dist, nn_idx = self._knn_face_centroids(points)
+        if nn_idx is None:
+            self.mesh_anchor_cached_normals = None
+            self.mesh_anchor_cached_reliable = None
+            return
+
+        anchor_normal = self.mesh_anchor_face_normals[nn_idx]
+        anchor_normal = torch.nn.functional.normalize(anchor_normal, dim=1)
+
+        sorted_scales, _ = torch.sort(self.get_scaling.detach(), dim=1)
+        in_plane_scale = torch.sqrt(torch.clamp_min(sorted_scales[:, 1] * sorted_scales[:, 2], 1e-12))
+        dist_thresh = torch.clamp(in_plane_scale * float(distance_ratio), min=1e-5)
+        cos_abs = torch.abs(torch.sum(raw_normal * anchor_normal, dim=1))
+        reliable = (nn_dist <= dist_thresh) & (cos_abs >= float(normal_cos_thresh))
+
+        self.mesh_anchor_cached_normals = anchor_normal
+        self.mesh_anchor_cached_reliable = reliable
     
     
     # 在训练循环中调用的函数，用于更新方向统计
@@ -720,8 +830,6 @@ class GaussianModel:
         if self.view_dir_accumulation is None:
             # 处理加载旧模型的情况
             self.view_dir_accumulation = torch.zeros((self._xyz.shape[0], 3), device="cuda")
-        if self.view_dir_count is None:
-            self.view_dir_count = torch.zeros((self._xyz.shape[0],), dtype=torch.float32, device="cuda")
         
         # 计算从高斯指向相机的向量
         # visible_xyz = self._xyz[visibility_filter]
@@ -742,47 +850,47 @@ class GaussianModel:
         
         # 累加
         self.view_dir_accumulation[visible_indices] += dirs
-        self.view_dir_count[visible_indices] += 1.0
     
-    def get_oriented_normal(self, prior_center=None, min_view_count: int = 10):
+    def get_oriented_normal(self):
         """
         获取经过视角统计修正后的法线
         """
-        # 1. 原始无向法线
         raw_normal = self.get_smallest_axis()
+        n = raw_normal.shape[0]
+        sign = torch.ones((n, 1), dtype=raw_normal.dtype, device=raw_normal.device)
 
-        # 2. 视角统计：只有在统计足够可靠时才启用
-        if (self.view_dir_accumulation is not None) and (self.view_dir_count is not None):
-            reliable = self.view_dir_count >= int(min_view_count)
+        anchor_ready = (
+            self.mesh_anchor_cached_normals is not None
+            and self.mesh_anchor_cached_reliable is not None
+            and self.mesh_anchor_cached_normals.shape[0] == n
+            and self.mesh_anchor_cached_reliable.shape[0] == n
+        )
+
+        if anchor_ready:
+            reliable = self.mesh_anchor_cached_reliable
+            if bool(torch.any(reliable)):
+                dot_mesh = torch.sum(
+                    raw_normal[reliable] * self.mesh_anchor_cached_normals[reliable],
+                    dim=1,
+                    keepdim=True,
+                )
+                sign_mesh = torch.sign(dot_mesh)
+                sign_mesh[sign_mesh == 0] = 1.0
+                sign[reliable] = sign_mesh
+            need_view = ~reliable
         else:
-            reliable = None
-             
-        # 3. 先验（外侧方向）：prior_center -> outward = x - center
-        if prior_center is None:
-            # 没有中心时，退化为原逻辑（如果有 view_dir_accumulation）或 raw
-            if self.view_dir_accumulation is None:
-                return raw_normal
-            dot_check = torch.sum(raw_normal * self.view_dir_accumulation, dim=1, keepdim=True)
-            sign = torch.sign(dot_check)
-            sign[sign == 0] = 1.0
-            return raw_normal * sign
+            need_view = torch.ones((n,), dtype=torch.bool, device=raw_normal.device)
 
-        if not torch.is_tensor(prior_center):
-            prior_center = torch.tensor(prior_center, dtype=torch.float32, device=raw_normal.device)
-        prior_center = prior_center.to(device=raw_normal.device, dtype=torch.float32).view(1, 3)
-        outward = self._xyz.detach() - prior_center
-        outward = torch.nn.functional.normalize(outward, dim=1)
+        if self.view_dir_accumulation is not None and bool(torch.any(need_view)):
+            dot_view = torch.sum(
+                raw_normal[need_view] * self.view_dir_accumulation[need_view],
+                dim=1,
+                keepdim=True,
+            )
+            sign_view = torch.sign(dot_view)
+            sign_view[sign_view == 0] = 1.0
+            sign[need_view] = sign_view
 
-        # 4. 按门控决定翻转依据：可靠则用 view，否则用 outward
-        if (reliable is not None) and bool(torch.any(reliable)):
-            dot_view = torch.sum(raw_normal * self.view_dir_accumulation, dim=1, keepdim=True)
-            dot_prior = torch.sum(raw_normal * outward, dim=1, keepdim=True)
-            dot_check = torch.where(reliable.view(-1, 1), dot_view, dot_prior)
-        else:
-            dot_check = torch.sum(raw_normal * outward, dim=1, keepdim=True)
-
-        sign = torch.sign(dot_check)
-        sign[sign == 0] = 1.0
         return raw_normal * sign
     
     def save_view_dir_viz(self, path):
@@ -828,59 +936,7 @@ class GaussianModel:
         PlyData([el]).write(path)
         print(f"DEBUG: View direction visualization saved to {path}")
 
-    def save_view_dir_reliability_ply(self, path, min_view_count: int = 10, prior_center=None, visibility_mask=None):
-        """Export a PLY that highlights unreliable Gaussians.
-
-        Reliable points are colored green, unreliable points are colored red.
-        The vertex normal stores the oriented normal used by the current policy.
-        """
-        mkdir_p(os.path.dirname(path))
-
-        points = self._xyz.detach().cpu().numpy()
-        normals = self.get_oriented_normal(prior_center=prior_center, min_view_count=min_view_count).detach().cpu().numpy()
-
-        if self.view_dir_count is None:
-            count = np.zeros((points.shape[0],), dtype=np.float32)
-        else:
-            count = self.view_dir_count.detach().cpu().numpy().astype(np.float32)
-
-        if visibility_mask is not None:
-            mask = visibility_mask.detach().cpu().numpy().astype(bool)
-        else:
-            mask = np.ones((points.shape[0],), dtype=bool)
-
-        reliable = count >= float(min_view_count)
-        reliable = reliable & mask
-        unreliable = (~reliable) & mask
-
-        colors = np.zeros((points.shape[0], 3), dtype=np.uint8)
-        colors[reliable] = np.array([0, 220, 0], dtype=np.uint8)
-        colors[unreliable] = np.array([220, 0, 0], dtype=np.uint8)
-
-        dtype_full = [
-            ('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
-            ('nx', 'f4'), ('ny', 'f4'), ('nz', 'f4'),
-            ('view_count', 'f4'),
-            ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')
-        ]
-
-        elements = np.empty(points.shape[0], dtype=dtype_full)
-        elements['x'] = points[:, 0]
-        elements['y'] = points[:, 1]
-        elements['z'] = points[:, 2]
-        elements['nx'] = normals[:, 0]
-        elements['ny'] = normals[:, 1]
-        elements['nz'] = normals[:, 2]
-        elements['view_count'] = count
-        elements['red'] = colors[:, 0]
-        elements['green'] = colors[:, 1]
-        elements['blue'] = colors[:, 2]
-
-        el = PlyElement.describe(elements, 'vertex')
-        PlyData([el]).write(path)
-        print(f"DEBUG: View-dir reliability visualization saved to {path}")
-
-    def extract_oriented_pointcloud(self, opacity_threshold=0.0, normalize_weight=True, visibility_mask=None, log_weight=False, prior_center=None, min_view_count: int = 10):
+    def extract_oriented_pointcloud(self, opacity_threshold=0.0, normalize_weight=True, visibility_mask=None, log_weight=False):
         """
         导出有向点云（中心点版本）：
         - points: 高斯中心
@@ -891,7 +947,7 @@ class GaussianModel:
             points [M, 3], normals [M, 3], weights [M], mask [N]
         """
         points = self.get_xyz
-        normals = self.get_oriented_normal(prior_center=prior_center, min_view_count=min_view_count)
+        normals = self.get_oriented_normal()
 
         opacity = self.get_opacity.squeeze(-1)
         scales = self.get_scaling
@@ -915,7 +971,7 @@ class GaussianModel:
 
         return points, normals, weights, mask
 
-    def save_oriented_pointcloud_ply(self, path, opacity_threshold=0.0, normalize_weight=True, visibility_mask=None, log_weight=False, prior_center=None, min_view_count: int = 10):
+    def save_oriented_pointcloud_ply(self, path, opacity_threshold=0.0, normalize_weight=True, visibility_mask=None, log_weight=False):
         """
         保存有向点云到 PLY：
         - x, y, z
@@ -929,8 +985,6 @@ class GaussianModel:
             normalize_weight=normalize_weight,
             visibility_mask=visibility_mask,
             log_weight=log_weight,
-            prior_center=prior_center,
-            min_view_count=min_view_count,
         )
 
         points_np = points.detach().cpu().numpy()

@@ -125,6 +125,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             min_scale_ratio=1e-4,
             max_scale_ratio=0.05,
         )
+        if opt.use_mesh_normal_anchor:
+            gaussians.set_mesh_normal_anchor(mesh_for_init)
     else:
         print(f"mesh_init.ply not found at {mesh_init_path}, fallback to COLMAP point cloud initialization.")
 
@@ -159,7 +161,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     os.makedirs(debug_path, exist_ok=True)
     observe_count = torch.zeros((gaussians.get_xyz.shape[0],), dtype=torch.bool, device="cuda")
     fixed_bbox_center, fixed_bbox_half_extent = compute_padded_bbox_from_mesh(mesh_for_init, padding=0.10)
-    fixed_bbox_center_t = torch.tensor(fixed_bbox_center, dtype=torch.float32, device="cuda")
     # Pre-create mesh_model to avoid repeated instantiation inside the loop
     mesh_model = MeshModel(
         grid_res=opt.grid_res_in_the_loop,
@@ -187,14 +188,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     for iteration in range(first_iter, opt.iterations + 1):
         iter_start.record()
         gaussians.update_learning_rate(iteration)
-
         # EMA decay for view-direction stats (approx. recent-window reliability)
-        if opt.view_dir_decay < 1.0 and (iteration % opt.view_dir_decay_interval == 0):
+        if opt.view_dir_decay < 1.0 and (iteration % opt.densification_interval == 1):
             gaussians.decay_view_dir_stats(opt.view_dir_decay)
         # Freeze Gaussian rotations for early iterations so they stick to mesh
         if iteration < 100:
             freeze_gaussians_rotation(gaussians, True)
-        elif iteration == 100:
+        elif iteration == 101:
             freeze_gaussians_rotation(gaussians, False)
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
@@ -225,19 +225,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         
         # 统计视角方向，用于后续修正法线
         with torch.no_grad():
+            if opt.use_mesh_normal_anchor and (iteration % opt.densification_interval == 1):
+                gaussians.update_mesh_normal_cache(
+                    distance_ratio=opt.mesh_anchor_dist_ratio,
+                    normal_cos_thresh=opt.mesh_anchor_normal_cos_thresh,
+                )
             if observe_count.shape[0] != gaussians.get_xyz.shape[0]:
                 observe_count = torch.zeros((gaussians.get_xyz.shape[0],), dtype=torch.bool, device="cuda")
             gaussians.add_view_dir_stat(viewpoint_cam.camera_center, visibility_filter)
             observe_count |= visibility_filter
         
-        if (iteration >= 100):
+        if (iteration > 100):
             points, normals, weights, _ = gaussians.extract_oriented_pointcloud(
                 opacity_threshold=opt.mesh_opacity_threshold,
                 normalize_weight=True,
                 visibility_mask=observe_count > 0,
                 log_weight=False,
-                prior_center=fixed_bbox_center_t,
-                min_view_count=opt.view_dir_min_count,
             )
             mesh_out = mesh_model.reconstruct(points, normals, weights)
             # 用导出的 mesh 渲染法线图和深度图
@@ -272,7 +275,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             mesh_mask = (mesh_depth > 0)
             gauss_mask = (gauss_depth > 0)
             raster_mask = mesh_mask & gauss_mask
-            if opt.mesh_depth_weight > 0.0:
+            if opt.mesh_depth_weight >= 0.0:
                 mesh_depth_loss, mesh_depth_map = milo_mesh_depth_loss_log(
                     mesh_depth=mesh_depth,
                     gaussians_depth=gauss_depth,
@@ -281,7 +284,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 )
                 mesh_depth_loss = opt.mesh_depth_weight * mesh_depth_loss
                 loss += mesh_depth_loss
-            if opt.mesh_normal_weight > 0.0:
+            if opt.mesh_normal_weight >= 0.0:
                 mesh_normal_loss, mesh_normal_map = milo_mesh_normal_loss_absdot(
                     mesh_normal_view=mesh_normal,
                     gaussians_normal_view=gauss_normal,
@@ -410,22 +413,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     debug_viz_path = os.path.join(scene.model_path, "debug_viz")
                     os.makedirs(debug_viz_path, exist_ok=True)
                     viz_path_oriented_pc = os.path.join(scene.model_path, "debug_viz", f"oriented_pointcloud_{iteration}.ply")
-                    gaussians.save_oriented_pointcloud_ply(
-                        viz_path_oriented_pc,
-                        opacity_threshold=opt.mesh_opacity_threshold,
-                        normalize_weight=True,
-                        visibility_mask=observe_count > 0,
-                        log_weight=True,
-                        prior_center=fixed_bbox_center_t,
-                        min_view_count=opt.view_dir_min_count,
-                    )
-                    viz_path_reliability = os.path.join(scene.model_path, "debug_viz", f"view_dir_reliability_{iteration}.ply")
-                    gaussians.save_view_dir_reliability_ply(
-                        viz_path_reliability,
-                        min_view_count=opt.view_dir_min_count,
-                        prior_center=fixed_bbox_center_t,
-                        visibility_mask=observe_count > 0,
-                    )
+                    gaussians.save_oriented_pointcloud_ply(viz_path_oriented_pc, opacity_threshold=opt.mesh_opacity_threshold, normalize_weight=True, visibility_mask=observe_count > 0, log_weight=True)
                     mesh_path = os.path.join(scene.model_path, "debug_viz", f"dpsr_diffmc_mesh_{iteration}.ply")
                     mesh_model.save_mesh_ply(mesh_path, mesh_out["verts"], mesh_out["faces"])
 
@@ -538,9 +526,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, opt.densify_abs_grad_threshold, 
-                                                opt.opacity_cull_threshold, scene.cameras_extent, size_threshold)
-            
-            # multi-view observe trim
+                                                opt.opacity_cull_threshold, scene.cameras_extent, size_threshold)                        # multi-view observe trim
             if opt.use_multi_view_trim and iteration % 1000 == 0 and iteration < opt.densify_until_iter:
                 observe_the = 2
                 observe_cnt = torch.zeros_like(gaussians.get_opacity)
