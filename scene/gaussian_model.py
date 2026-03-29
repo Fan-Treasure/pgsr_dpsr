@@ -16,12 +16,17 @@ from torch import nn
 import os
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
-from utils.sh_utils import RGB2SH
+from utils.sh_utils import RGB2SH, SH2RGB
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from pytorch3d.transforms import quaternion_to_matrix, matrix_to_quaternion
 from pytorch3d.ops import knn_points
+from utils.mesh_guided_densify_utils import (
+    compute_face_coverage_mask,
+    visible_uncovered_face_ids,
+    build_orthonormal_frame_from_normals,
+)
 
 def dilate(bin_img, ksize=5):
     pad = (ksize - 1) // 2
@@ -80,6 +85,21 @@ class GaussianModel:
         self.mesh_anchor_face_normals = None  # 对应三角面的单位法线缓存
         self.mesh_anchor_cached_normals = None  # 每个高斯当前匹配到的锚点法线
         self.mesh_anchor_cached_reliable = None  # 每个高斯的最近邻可靠性掩码
+        self.mesh_guidance_face_centroids = None
+        self.mesh_guidance_face_visible = None
+        self.mesh_guidance_face_normals = None
+
+    @torch.no_grad()
+    def set_mesh_guidance(self, face_centroids, face_visible, face_normals=None):
+        self.mesh_guidance_face_centroids = None if face_centroids is None else face_centroids.detach()
+        self.mesh_guidance_face_visible = None if face_visible is None else face_visible.detach().bool()
+        self.mesh_guidance_face_normals = None if face_normals is None else face_normals.detach()
+
+    @torch.no_grad()
+    def clear_mesh_guidance(self):
+        self.mesh_guidance_face_centroids = None
+        self.mesh_guidance_face_visible = None
+        self.mesh_guidance_face_normals = None
 
     def decay_view_dir_stats(self, decay: float = 0.8):
         """EMA-style forgetting for view direction stats.
@@ -653,6 +673,84 @@ class GaussianModel:
 
             self.densification_postfix(new_xyz, new_knn_f, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
 
+    def densify_mesh_guided(self, grads, grads_abs, grad_threshold, grad_abs_threshold, scene_extent, max_radii2D, N=2):
+        """网格引导的 densify 流程。
+
+        整体逻辑是纯追加式，不删除已有高斯：
+        1. 先统计每个高斯的最近邻面片，并找出“没有被任何高斯选为最近邻”的面片；
+        2. 再把这组面片与当前帧 mesh 渲染器返回的可见面片取交集；
+        3. 只对交集里的面片新增高斯：位置放在面片中心，最短轴对齐面法线，颜色沿用最近高斯的颜色。
+        """
+        _ = (grads, grads_abs, grad_threshold, grad_abs_threshold, scene_extent, max_radii2D, N)
+        if (
+            self.mesh_guidance_face_centroids is None
+            or self.mesh_guidance_face_visible is None
+            or self.mesh_guidance_face_normals is None
+        ):
+            return
+
+        face_centroids = self.mesh_guidance_face_centroids.to(device=self.get_xyz.device)
+        face_visible = self.mesh_guidance_face_visible.to(device=self.get_xyz.device)
+        face_normals = self.mesh_guidance_face_normals.to(device=self.get_xyz.device)
+        if face_centroids.numel() == 0 or face_visible.numel() == 0 or face_normals.numel() == 0:
+            return
+
+        current_points = self.get_xyz
+        if current_points.numel() == 0:
+            return
+
+        # 先找出“被至少一个高斯覆盖到”的面片，剩下的就是候选空洞面片。
+        covered_face_mask, _, _ = compute_face_coverage_mask(face_centroids, current_points)
+        candidate_face_ids = visible_uncovered_face_ids(face_visible, covered_face_mask)
+        if candidate_face_ids.numel() == 0:
+            return
+
+        available_slots = int(self.max_all_points - current_points.shape[0])
+        if available_slots <= 0:
+            return
+
+        # 再在候选面片中挑出当前点云能够继续容纳的部分，避免超过总数上限。
+        candidate_centroids = face_centroids[candidate_face_ids]
+        nn_d2, nn_idx, _ = knn_points(candidate_centroids.unsqueeze(0), current_points.unsqueeze(0), K=1)
+        nn_idx = nn_idx[0, :, 0]
+        nn_dist = torch.sqrt(torch.clamp_min(nn_d2[0, :, 0], 1e-12))
+
+        if candidate_face_ids.shape[0] > available_slots:
+            keep_order = torch.argsort(nn_dist)[:available_slots]
+            candidate_face_ids = candidate_face_ids[keep_order]
+            nn_idx = nn_idx[keep_order]
+
+        if candidate_face_ids.numel() == 0:
+            return
+
+        # 面片中心作为新增高斯的位置，面法线作为其最短轴方向。
+        selected_centroids = face_centroids[candidate_face_ids]
+        selected_normals = face_normals[candidate_face_ids]
+        selected_rotation = matrix_to_quaternion(build_orthonormal_frame_from_normals(selected_normals))
+
+        # 颜色不从 mesh 读取，直接用最近高斯的颜色作为新高斯的外观先验。
+        nearest_dc = self._features_dc[nn_idx].squeeze(1)
+        nearest_rgb = torch.clamp(SH2RGB(nearest_dc), 0.0, 1.0)
+        new_features_dc = RGB2SH(nearest_rgb).unsqueeze(1)
+        new_features_rest = torch.zeros(
+            (candidate_face_ids.shape[0], self._features_rest.shape[1], self._features_rest.shape[2]),
+            dtype=self._features_rest.dtype,
+            device=self._features_rest.device,
+        )
+        new_opacity = self._opacity[nn_idx]
+        new_scaling = self._scaling[nn_idx]
+        new_knn_f = self._knn_f[nn_idx]
+
+        self.densification_postfix(
+            selected_centroids,
+            new_knn_f,
+            new_features_dc,
+            new_features_rest,
+            new_opacity,
+            new_scaling,
+            selected_rotation,
+        )
+
     def densify_and_prune(self, max_grad, abs_max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom
         grads_abs = self.xyz_gradient_accum_abs / self.denom_abs
@@ -662,6 +760,7 @@ class GaussianModel:
 
         self.densify_and_clone(grads, max_grad, extent)
         self.densify_and_split(grads, max_grad, grads_abs, abs_max_grad, extent, max_radii2D)
+        self.densify_mesh_guided(grads, grads_abs, max_grad, abs_max_grad, extent, max_radii2D)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
 

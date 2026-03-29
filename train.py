@@ -38,6 +38,11 @@ from scene.app_model import AppModel
 from scene.cameras import Camera
 from scene.mesh_model import MeshModel
 from mesh_renderer import render as render_mesh_normal_depth
+from utils.mesh_vis_utils import (
+    save_mesh_with_vertex_colors_ply,
+    vertex_colors_from_visible_faces,
+)
+from utils.mesh_guided_densify_utils import compute_face_geometry
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -107,28 +112,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     scene = Scene(dataset, gaussians)
 
     mesh_init_path = os.path.join(dataset.source_path, "mesh_init.ply")
-    if os.path.exists(mesh_init_path):
-        repaired_mesh_path = os.path.join(dataset.model_path, "mesh_init_filled.ply")
-        clean_and_repair(
-            input_mesh_path=mesh_init_path,
-            output_mesh_path=repaired_mesh_path,
-            max_hole_size=100,
-        )
-        mesh_for_init = repaired_mesh_path
-        print(f"Using mesh-based Gaussian initialization: {mesh_for_init}")
-        gaussians.create_from_mesh(
-            mesh_path=mesh_for_init,
-            spatial_lr_scale=scene.cameras_extent,
-            flatten_ratio=0.12,
-            tangent_scale=0.55,
-            opacity_init=0.10,
-            min_scale_ratio=1e-4,
-            max_scale_ratio=0.05,
-        )
-        if opt.use_mesh_normal_anchor:
-            gaussians.set_mesh_normal_anchor(mesh_for_init)
-    else:
-        print(f"mesh_init.ply not found at {mesh_init_path}, fallback to COLMAP point cloud initialization.")
+    repaired_mesh_path = os.path.join(dataset.model_path, "mesh_init_filled.ply")
+    clean_and_repair(
+        input_mesh_path=mesh_init_path,
+        output_mesh_path=repaired_mesh_path,
+        max_hole_size=100,
+    )
+    mesh_for_init = repaired_mesh_path
+    print(f"Using mesh-based Gaussian initialization: {mesh_for_init}")
+    gaussians.create_from_mesh(
+        mesh_path=mesh_for_init,
+        spatial_lr_scale=scene.cameras_extent,
+        flatten_ratio=0.12,
+        tangent_scale=0.55,
+        opacity_init=0.10,
+        min_scale_ratio=1e-4,
+        max_scale_ratio=0.05,
+    )
+    if opt.use_mesh_normal_anchor:
+        gaussians.set_mesh_normal_anchor(mesh_for_init)
 
     gaussians.training_setup(opt)
 
@@ -184,6 +186,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             outside_value=0.5,  
         )
         mesh_model.export_surface_prior_ply(os.path.join(scene.model_path, "surface_prior_points.ply"), threshold=0.3)
+
+    mesh_visibility_dir = os.path.join(scene.model_path, "debug_viz")
 
     for iteration in range(first_iter, opt.iterations + 1):
         iter_start.record()
@@ -525,8 +529,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, opt.densify_abs_grad_threshold, 
-                                                opt.opacity_cull_threshold, scene.cameras_extent, size_threshold)                        # multi-view observe trim
+                    # Mesh-guided densification: always enabled when mesh outputs are available.
+                    face_visible = mesh_render_pkg["face_visible"]
+                    faces = mesh_out["faces"]
+                    verts = mesh_out["verts"]
+                    if face_visible is not None and face_visible.numel() == faces.shape[0] and faces.numel() > 0:
+                        # Store mesh visibility and face normals for the post-clone/split guided densify pass.
+                        face_geometry = compute_face_geometry(verts, faces)
+                        gaussians.set_mesh_guidance(
+                            face_centroids=face_geometry["centroids"],
+                            face_visible=face_visible,
+                            face_normals=face_geometry["normals"],
+                        )
+
+                    gaussians.densify_and_prune(
+                        opt.densify_grad_threshold,
+                        opt.densify_abs_grad_threshold,
+                        opt.opacity_cull_threshold,
+                        scene.cameras_extent,
+                        size_threshold,
+                    )
+                    # Clear guidance (it is meant to bias only this densify step)
+                    gaussians.clear_mesh_guidance()
+                    # multi-view observe trim
             if opt.use_multi_view_trim and iteration % 1000 == 0 and iteration < opt.densify_until_iter:
                 observe_the = 2
                 observe_cnt = torch.zeros_like(gaussians.get_opacity)

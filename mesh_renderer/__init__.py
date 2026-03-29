@@ -82,6 +82,13 @@ def render(viewpoint_camera, verts_world: torch.Tensor, faces: torch.Tensor):
     pix_to_face = (rast[..., 3].to(torch.int64) - 1).squeeze(0)  # (H, W)
     valid_mask = pix_to_face >= 0
 
+    # Visible face mask (whether a face appears in rasterization)
+    face_visible = torch.zeros((faces.shape[0],), dtype=torch.bool, device=device)
+    if faces.shape[0] > 0:
+        vis_idx = torch.unique(pix_to_face[valid_mask])
+        if vis_idx.numel() > 0:
+            face_visible[vis_idx] = True
+
     if face_normals.shape[0] > 0:
         view_R = viewpoint_camera.world_view_transform[:3, :3]    # world->view rotation
         face_normals_view = torch.matmul(face_normals, view_R)    # (F, 3)
@@ -99,5 +106,7 @@ def render(viewpoint_camera, verts_world: torch.Tensor, faces: torch.Tensor):
         "rend_alpha": alpha,
         "rend_normal": rend_normal,  # (3, H, W)
         "rend_depth": depth_img,                      # (H, W)
+        "pix_to_face": pix_to_face,                   # (H, W)  -1 for background
+        "face_visible": face_visible,                 # (F,)
     }
  
