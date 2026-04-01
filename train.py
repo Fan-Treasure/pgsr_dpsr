@@ -31,17 +31,13 @@ from tqdm import tqdm
 from utils.general_utils import safe_state, freeze_gaussians_rotation
 from utils.graphics_utils import patch_offsets, patch_warp
 from utils.image_utils import psnr, erode
-from utils.mesh_utils import clean_and_repair, compute_padded_bbox_from_mesh
+from utils.mesh_utils import clean_and_repair, compute_padded_bbox_from_mesh, load_mesh_vertices_faces
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from scene.app_model import AppModel
 from scene.cameras import Camera
 from scene.mesh_model import MeshModel
 from mesh_renderer import render as render_mesh_normal_depth
-from utils.mesh_vis_utils import (
-    save_mesh_with_vertex_colors_ply,
-    vertex_colors_from_visible_faces,
-)
 from utils.mesh_guided_densify_utils import compute_face_geometry
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -58,7 +54,6 @@ def setup_seed(seed):
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
 setup_seed(22)
-
 def gen_virtul_cam(cam, trans_noise=1.0, deg_noise=15.0):
     Rt = np.zeros((4, 4))
     Rt[:3, :3] = cam.R.transpose()
@@ -129,8 +124,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         min_scale_ratio=1e-4,
         max_scale_ratio=0.05,
     )
-    if opt.use_mesh_normal_anchor:
-        gaussians.set_mesh_normal_anchor(mesh_for_init)
 
     gaussians.training_setup(opt)
 
@@ -187,7 +180,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         )
         mesh_model.export_surface_prior_ply(os.path.join(scene.model_path, "surface_prior_points.ply"), threshold=0.3)
 
-    mesh_visibility_dir = os.path.join(scene.model_path, "debug_viz")
+    init_mesh_verts, init_mesh_faces = load_mesh_vertices_faces(mesh_for_init)
+    init_mesh_geometry = compute_face_geometry(init_mesh_verts, init_mesh_faces)
+
+    def refresh_normal_flip_guidance_from_initial_mesh():
+        # init_face_visible = torch.ones((init_mesh_faces.shape[0],), dtype=torch.bool, device="cuda")
+        gaussians.set_mesh_guidance(
+            face_centroids=init_mesh_geometry["centroids"],
+            face_visible=None,
+            face_normals=init_mesh_geometry["normals"],
+        )
+        gaussians.update_mesh_normal_cache(
+            distance_ratio=opt.mesh_guidance_dist_ratio,
+            normal_cos_thresh=opt.mesh_guidance_normal_cos_thresh,
+        )
 
     for iteration in range(first_iter, opt.iterations + 1):
         iter_start.record()
@@ -200,6 +206,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             freeze_gaussians_rotation(gaussians, True)
         elif iteration == 101:
             freeze_gaussians_rotation(gaussians, False)
+        
+        if iteration == opt.mesh_from_iter:
+            # 训练过程中的 mesh 还没重建出来，先用初始 mesh 初始化法线翻转缓存。
+            refresh_normal_flip_guidance_from_initial_mesh()
+
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
@@ -229,22 +240,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         
         # 统计视角方向，用于后续修正法线
         with torch.no_grad():
-            if opt.use_mesh_normal_anchor and (iteration % opt.densification_interval == 1):
-                gaussians.update_mesh_normal_cache(
-                    distance_ratio=opt.mesh_anchor_dist_ratio,
-                    normal_cos_thresh=opt.mesh_anchor_normal_cos_thresh,
-                )
             if observe_count.shape[0] != gaussians.get_xyz.shape[0]:
                 observe_count = torch.zeros((gaussians.get_xyz.shape[0],), dtype=torch.bool, device="cuda")
             gaussians.add_view_dir_stat(viewpoint_cam.camera_center, visibility_filter)
             observe_count |= visibility_filter
         
-        if (iteration > 100):
+        if (iteration > opt.mesh_from_iter):
             points, normals, weights, _ = gaussians.extract_oriented_pointcloud(
                 opacity_threshold=opt.mesh_opacity_threshold,
                 normalize_weight=True,
                 visibility_mask=observe_count > 0,
                 log_weight=False,
+                use_cut_points=opt.use_cut_points_for_mesh,
             )
             mesh_out = mesh_model.reconstruct(points, normals, weights)
             # 用导出的 mesh 渲染法线图和深度图
@@ -358,7 +365,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     weights = torch.ones_like(pixel_noise)
                     weights[~d_mask] = 0
                 
-                if (iteration % 500 == 0) or ((iteration < 1000) and (iteration % 200 == 0)):
+                if (iteration % 500 == 0) or (iteration == 200):
                     gt_img_show = ((gt_image).permute(1,2,0).clamp(0,1)[:,:,[2,1,0]]*255).detach().cpu().numpy().astype(np.uint8)
                     if 'app_image' in render_pkg:
                         img_show = ((render_pkg['app_image']).permute(1,2,0).clamp(0,1)[:,:,[2,1,0]]*255).detach().cpu().numpy().astype(np.uint8)
@@ -383,43 +390,46 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     row0 = np.concatenate([gt_img_show, img_show, normal_show, distance_color], axis=1)
                     # 第二行：左->右 = 几何一致性/权重掩码（d_mask_show_color）、参考深度热图（depth_color）、深度法线可视化（depth_normal_show）、像素权重热图（image_weight_color）
                     row1 = np.concatenate([d_mask_show_color, depth_color, depth_normal_show, image_weight_color], axis=1)
+                    image_to_show = np.concatenate([row0, row1], axis=0)
                     # 第三行：优先显示 mesh 渲染的法线/深度（若已缓存），否则回退到多张几何损失热图（geo_loss_color）
                     # mesh normal -> same format as normal_show (H,W,3) uint8
-                    rend_normal_t = ((mesh_normal + 1.0) * 0.5).permute(1, 2, 0).clamp(0, 1)
-                    mesh_normal_show = (rend_normal_t * 255).detach().cpu().numpy().astype(np.uint8)
-                    # mesh depth -> single-channel -> apply colormap like depth_color
-                    depth_arr = mesh_depth.squeeze().detach().cpu().numpy()
-                    d_min, d_max = depth_arr.min(), depth_arr.max()
-                    depth_norm = (depth_arr - d_min) / (d_max - d_min)
-                    depth_u8 = (depth_norm * 255).clip(0, 255).astype(np.uint8)
-                    mesh_depth_show = cv2.applyColorMap(depth_u8, cv2.COLORMAP_JET)
                     
-                    mesh_dmap = mesh_depth_map.detach().cpu().numpy()
-                    # 归一化（忽略未被 raster 的像素）
-                    valid = raster_mask.detach().cpu().numpy().astype(bool)
-                    v = mesh_dmap[valid]
-                    mn, mx = float(v.min()), float(v.max())
-                    norm = (mesh_dmap - mn) / max((mx - mn), 1e-8)
-                    norm_u8 = (np.clip(norm, 0.0, 1.0) * 255).astype(np.uint8)
-                    mesh_dmap_show = cv2.applyColorMap(norm_u8, cv2.COLORMAP_JET)
-                    mesh_nmap = mesh_normal_map.detach().cpu().numpy()
-                    valid = raster_mask.detach().cpu().numpy().astype(bool)
-                    v = mesh_nmap[valid]
-                    mn, mx = float(v.min()), float(v.max())
-                    norm = (mesh_nmap - mn) / max((mx - mn), 1e-8)
-                    norm_u8 = (np.clip(norm, 0.0, 1.0) * 255).astype(np.uint8)
-                    mesh_nmap_show = cv2.applyColorMap(norm_u8, cv2.COLORMAP_JET)
-                    row2 = np.concatenate([mesh_dmap_show, mesh_depth_show, mesh_normal_show, mesh_nmap_show], axis=1)
-                    image_to_show = np.concatenate([row0, row1, row2], axis=0)
-                    cv2.imwrite(os.path.join(debug_path, "%05d"%iteration + "_" + viewpoint_cam.image_name + ".jpg"), image_to_show)
+                    if ( 'mesh_depth' in locals() and 'mesh_normal' in locals() ):
+                        rend_normal_t = ((mesh_normal + 1.0) * 0.5).permute(1, 2, 0).clamp(0, 1)
+                        mesh_normal_show = (rend_normal_t * 255).detach().cpu().numpy().astype(np.uint8)
+                        # mesh depth -> single-channel -> apply colormap like depth_color
+                        depth_arr = mesh_depth.squeeze().detach().cpu().numpy()
+                        d_min, d_max = depth_arr.min(), depth_arr.max()
+                        depth_norm = (depth_arr - d_min) / (d_max - d_min)
+                        depth_u8 = (depth_norm * 255).clip(0, 255).astype(np.uint8)
+                        mesh_depth_show = cv2.applyColorMap(depth_u8, cv2.COLORMAP_JET)
+                        
+                        mesh_dmap = mesh_depth_map.detach().cpu().numpy()
+                        # 归一化（忽略未被 raster 的像素）
+                        valid = raster_mask.detach().cpu().numpy().astype(bool)
+                        v = mesh_dmap[valid]
+                        mn, mx = float(v.min()), float(v.max())
+                        norm = (mesh_dmap - mn) / max((mx - mn), 1e-8)
+                        norm_u8 = (np.clip(norm, 0.0, 1.0) * 255).astype(np.uint8)
+                        mesh_dmap_show = cv2.applyColorMap(norm_u8, cv2.COLORMAP_JET)
+                        mesh_nmap = mesh_normal_map.detach().cpu().numpy()
+                        valid = raster_mask.detach().cpu().numpy().astype(bool)
+                        v = mesh_nmap[valid]
+                        mn, mx = float(v.min()), float(v.max())
+                        norm = (mesh_nmap - mn) / max((mx - mn), 1e-8)
+                        norm_u8 = (np.clip(norm, 0.0, 1.0) * 255).astype(np.uint8)
+                        mesh_nmap_show = cv2.applyColorMap(norm_u8, cv2.COLORMAP_JET)
+                        row2 = np.concatenate([mesh_dmap_show, mesh_depth_show, mesh_normal_show, mesh_nmap_show], axis=1)
+                        image_to_show = np.concatenate([row0, row1, row2], axis=0)
 
-                    # [NEW] 保存有向点云PLY（带权重）
-                    debug_viz_path = os.path.join(scene.model_path, "debug_viz")
-                    os.makedirs(debug_viz_path, exist_ok=True)
-                    viz_path_oriented_pc = os.path.join(scene.model_path, "debug_viz", f"oriented_pointcloud_{iteration}.ply")
-                    gaussians.save_oriented_pointcloud_ply(viz_path_oriented_pc, opacity_threshold=opt.mesh_opacity_threshold, normalize_weight=True, visibility_mask=observe_count > 0, log_weight=True)
-                    mesh_path = os.path.join(scene.model_path, "debug_viz", f"dpsr_diffmc_mesh_{iteration}.ply")
-                    mesh_model.save_mesh_ply(mesh_path, mesh_out["verts"], mesh_out["faces"])
+                        # [NEW] 保存有向点云PLY（带权重）
+                        debug_viz_path = os.path.join(scene.model_path, "debug_viz")
+                        os.makedirs(debug_viz_path, exist_ok=True)
+                        viz_path_oriented_pc = os.path.join(scene.model_path, "debug_viz", f"oriented_pointcloud_{iteration}.ply")
+                        gaussians.save_oriented_pointcloud_ply(viz_path_oriented_pc, opacity_threshold=opt.mesh_opacity_threshold, normalize_weight=True, visibility_mask=observe_count > 0, log_weight=True, use_cut_points=opt.use_cut_points_for_mesh)
+                        mesh_path = os.path.join(scene.model_path, "debug_viz", f"dpsr_diffmc_mesh_{iteration}.ply")
+                        mesh_model.save_mesh_ply(mesh_path, mesh_out["verts"], mesh_out["faces"])
+                    cv2.imwrite(os.path.join(debug_path, "%05d"%iteration + "_" + viewpoint_cam.image_name + ".jpg"), image_to_show)
 
                 if d_mask.sum() > 0:
                     geo_loss = geo_weight * ((weights * pixel_noise)[d_mask]).mean()
@@ -519,6 +529,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
                     
+            if (iteration > opt.mesh_from_iter) and (iteration % opt.densification_interval) == 0:
+                face_visible = mesh_render_pkg["face_visible"]
+                faces = mesh_out["faces"]
+                verts = mesh_out["verts"]
+                # Store mesh visibility and face normals for the post-clone/split guided densify pass.
+                face_geometry = compute_face_geometry(verts, faces)
+                gaussians.set_mesh_guidance(
+                    face_centroids=face_geometry["centroids"],
+                    face_visible=face_visible,
+                    face_normals=face_geometry["normals"],
+                )
+                    
             # Densification
             if iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
@@ -527,31 +549,39 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 viewspace_point_tensor_abs = render_pkg["viewspace_points_abs"]
                 gaussians.add_densification_stats(viewspace_point_tensor, viewspace_point_tensor_abs, visibility_filter)
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                if (iteration > opt.densify_from_iter) and (iteration % opt.densification_interval == 0) and (iteration > opt.mesh_from_iter):                                          
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     # Mesh-guided densification: always enabled when mesh outputs are available.
-                    face_visible = mesh_render_pkg["face_visible"]
-                    faces = mesh_out["faces"]
-                    verts = mesh_out["verts"]
-                    if face_visible is not None and face_visible.numel() == faces.shape[0] and faces.numel() > 0:
-                        # Store mesh visibility and face normals for the post-clone/split guided densify pass.
-                        face_geometry = compute_face_geometry(verts, faces)
-                        gaussians.set_mesh_guidance(
-                            face_centroids=face_geometry["centroids"],
-                            face_visible=face_visible,
-                            face_normals=face_geometry["normals"],
-                        )
-
                     gaussians.densify_and_prune(
                         opt.densify_grad_threshold,
                         opt.densify_abs_grad_threshold,
                         opt.opacity_cull_threshold,
                         scene.cameras_extent,
                         size_threshold,
+                        mesh_guide=True
                     )
-                    # Clear guidance (it is meant to bias only this densify step)
+                elif (iteration > opt.densify_from_iter) and (iteration % opt.densification_interval) == 0:
+                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                    gaussians.densify_and_prune(
+                        opt.densify_grad_threshold,
+                        opt.densify_abs_grad_threshold,
+                        opt.opacity_cull_threshold,
+                        scene.cameras_extent,
+                        size_threshold,
+                        mesh_guide=False
+                    )
+                        
+            if iteration > opt.mesh_from_iter and iteration % opt.densification_interval == 0:
+                # 法向翻转缓存必须在 densify/prune 之后重建，才能覆盖新增/删除后的高斯状态。
+                if opt.use_initial_mesh_for_normal_flip:
                     gaussians.clear_mesh_guidance()
-                    # multi-view observe trim
+                    refresh_normal_flip_guidance_from_initial_mesh()
+                else:
+                    gaussians.update_mesh_normal_cache(
+                        distance_ratio=opt.mesh_guidance_dist_ratio,
+                        normal_cos_thresh=opt.mesh_guidance_normal_cos_thresh,
+                    )
+            # multi-view observe trim
             if opt.use_multi_view_trim and iteration % 1000 == 0 and iteration < opt.densify_until_iter:
                 observe_the = 2
                 observe_cnt = torch.zeros_like(gaussians.get_opacity)

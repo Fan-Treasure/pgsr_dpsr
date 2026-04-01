@@ -117,16 +117,19 @@ class OptimizationParams(ParamGroup):
         self.exposure_compensation = False
         self.random_background = False
         
+        self.mesh_from_iter = 5000
         self.no_surface_prior = False
         self.detach_gaussian_rendering = False
-        self.grid_res_in_the_loop = 256
+        self.grid_res_in_the_loop = 360
         self.mesh_opacity_threshold = 0.05
+        self.use_cut_points_for_mesh = False
         self.view_dir_decay = 0.5
         
         # Mesh-guided normal orientation (fallback to EMA view-direction stats)
-        self.use_mesh_normal_anchor = True
-        self.mesh_anchor_dist_ratio = 3.0
-        self.mesh_anchor_normal_cos_thresh = 0.5  # 60度夹角
+        # True: 始终用初始 mesh 引导法向翻转；False: iteration > 100 后改用当前 mesh
+        self.use_initial_mesh_for_normal_flip = True
+        self.mesh_guidance_dist_ratio = 3.0
+        self.mesh_guidance_normal_cos_thresh = 0.5  # 60度夹角
 
         # MILO-style mesh depth/normal regularization (only applied when mesh render is available)
         self.mesh_depth_weight = 0.05

@@ -37,6 +37,10 @@ from trajectory_io import read_trajectory, convert_trajectory_to_pointcloud
 import copy
 import numpy as np
 import open3d as o3d
+try:
+    from open3d import registration
+except:
+    from open3d.pipelines import registration
 
 MAX_POINT_NUMBER = 4e6
 
@@ -65,40 +69,45 @@ def gen_sparse_trajectory(mapping, f_trajectory):
 def trajectory_alignment(map_file, traj_to_register, gt_traj_col, gt_trans,
                          scene):
     traj_pcd_col = convert_trajectory_to_pointcloud(gt_traj_col)
-    traj_pcd_col.transform(gt_trans)
+    if gt_trans is not None:
+        traj_pcd_col.transform(gt_trans)
     corres = o3d.utility.Vector2iVector(
         np.asarray(list(map(lambda x: [x, x], range(len(gt_traj_col))))))
-    rr = o3d.registration.RANSACConvergenceCriteria()
+    rr = registration.RANSACConvergenceCriteria()
     rr.max_iteration = 100000
-    rr.max_validation = 100000
+    # rr.max_validation = 100000
 
     # in this case a log file was used which contains
     # every movie frame (see tutorial for details)
-    if len(traj_to_register) > 1600:
+    if len(traj_to_register) > 1600 and map_file is not None:
         n_sampled_frames, n_total_frames, mapping = read_mapping(map_file)
         traj_col2 = gen_sparse_trajectory(mapping, traj_to_register)
         traj_to_register_pcd = convert_trajectory_to_pointcloud(traj_col2)
     else:
+        print("Estimated trajectory will leave as it is, no sparsity op is performed!")
         traj_to_register_pcd = convert_trajectory_to_pointcloud(
             traj_to_register)
     randomvar = 0.0
-    nr_of_cam_pos = len(traj_to_register_pcd.points)
-    rand_number_added = np.asanyarray(traj_to_register_pcd.points) * (
-        np.random.rand(nr_of_cam_pos, 3) * randomvar - randomvar / 2.0 + 1)
-    list_rand = list(rand_number_added)
-    traj_to_register_pcd_rand = o3d.geometry.PointCloud()
-    for elem in list_rand:
-        traj_to_register_pcd_rand.points.append(elem)
+    if randomvar < 1e-5:
+        traj_to_register_pcd_rand = traj_to_register_pcd
+    else:
+        nr_of_cam_pos = len(traj_to_register_pcd.points)
+        rand_number_added = np.asanyarray(traj_to_register_pcd.points) * (
+            np.random.rand(nr_of_cam_pos, 3) * randomvar - randomvar / 2.0 + 1)
+        list_rand = list(rand_number_added)
+        traj_to_register_pcd_rand = o3d.geometry.PointCloud()
+        for elem in list_rand:
+            traj_to_register_pcd_rand.points.append(elem)
 
     # Rough registration based on aligned colmap SfM data
-    reg = o3d.registration.registration_ransac_based_on_correspondence(
+    reg = registration.registration_ransac_based_on_correspondence(
         traj_to_register_pcd_rand,
         traj_pcd_col,
         corres,
         0.2,
-        o3d.registration.TransformationEstimationPointToPoint(True),
+        registration.TransformationEstimationPointToPoint(True),
         6,
-        rr,
+        criteria=rr,
     )
     return reg.transformation
 
@@ -144,13 +153,13 @@ def registration_unif(
     t = crop_and_downsample(gt_target,
                             crop_volume,
                             down_sample_method="uniform")
-    reg = o3d.registration.registration_icp(
+    reg = registration.registration_icp(
         s,
         t,
         threshold,
         np.identity(4),
-        o3d.registration.TransformationEstimationPointToPoint(True),
-        o3d.registration.ICPConvergenceCriteria(1e-6, max_itr),
+        registration.TransformationEstimationPointToPoint(True),
+        registration.ICPConvergenceCriteria(1e-6, max_itr),
     )
     reg.transformation = np.matmul(reg.transformation, init_trans)
     return reg
@@ -183,13 +192,13 @@ def registration_vol_ds(
         down_sample_method="voxel",
         voxel_size=voxel_size,
     )
-    reg = o3d.registration.registration_icp(
+    reg = registration.registration_icp(
         s,
         t,
         threshold,
         np.identity(4),
-        o3d.registration.TransformationEstimationPointToPoint(True),
-        o3d.registration.ICPConvergenceCriteria(1e-6, max_itr),
+        registration.TransformationEstimationPointToPoint(True),
+        registration.ICPConvergenceCriteria(1e-6, max_itr),
     )
     reg.transformation = np.matmul(reg.transformation, init_trans)
     return reg

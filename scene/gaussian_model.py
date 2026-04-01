@@ -21,8 +21,8 @@ from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from pytorch3d.transforms import quaternion_to_matrix, matrix_to_quaternion
-from pytorch3d.ops import knn_points
 from utils.mesh_guided_densify_utils import (
+    knn_1nn,
     compute_face_coverage_mask,
     visible_uncovered_face_ids,
     build_orthonormal_frame_from_normals,
@@ -81,18 +81,17 @@ class GaussianModel:
         self.setup_functions()
         self.use_app = False
         self.view_dir_accumulation = None
-        self.mesh_anchor_face_centroids = None  # 初始 mesh 所有三角面的中心点缓存
-        self.mesh_anchor_face_normals = None  # 对应三角面的单位法线缓存
-        self.mesh_anchor_cached_normals = None  # 每个高斯当前匹配到的锚点法线
-        self.mesh_anchor_cached_reliable = None  # 每个高斯的最近邻可靠性掩码
+        self.mesh_guidance_cached_normals = None  # 每个高斯当前匹配到的网格引导法线
+        self.mesh_guidance_cached_reliable = None  # 每个高斯的最近邻可靠性掩码
         self.mesh_guidance_face_centroids = None
         self.mesh_guidance_face_visible = None
         self.mesh_guidance_face_normals = None
 
     @torch.no_grad()
-    def set_mesh_guidance(self, face_centroids, face_visible, face_normals=None):
+    def set_mesh_guidance(self, face_centroids, face_visible=None, face_normals=None):
         self.mesh_guidance_face_centroids = None if face_centroids is None else face_centroids.detach()
-        self.mesh_guidance_face_visible = None if face_visible is None else face_visible.detach().bool()
+        if face_visible is not None:
+            self.mesh_guidance_face_visible = face_visible.detach().bool()
         self.mesh_guidance_face_normals = None if face_normals is None else face_normals.detach()
 
     @torch.no_grad()
@@ -528,10 +527,10 @@ class GaussianModel:
         self.max_weight = self.max_weight[valid_points_mask]
         if self.view_dir_accumulation is not None:
             self.view_dir_accumulation = self.view_dir_accumulation[valid_points_mask]
-        if self.mesh_anchor_cached_normals is not None:
-            self.mesh_anchor_cached_normals = self.mesh_anchor_cached_normals[valid_points_mask]
-        if self.mesh_anchor_cached_reliable is not None:
-            self.mesh_anchor_cached_reliable = self.mesh_anchor_cached_reliable[valid_points_mask]
+        if self.mesh_guidance_cached_normals is not None:
+            self.mesh_guidance_cached_normals = self.mesh_guidance_cached_normals[valid_points_mask]
+        if self.mesh_guidance_cached_reliable is not None:
+            self.mesh_guidance_cached_reliable = self.mesh_guidance_cached_reliable[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -583,12 +582,12 @@ class GaussianModel:
         if self.view_dir_accumulation is None:
             self.view_dir_accumulation = torch.zeros((self._xyz.shape[0] - new_xyz.shape[0], 3), device="cuda")
         self.view_dir_accumulation = torch.cat((self.view_dir_accumulation, new_dirs), dim=0)
-        if self.mesh_anchor_cached_normals is not None:
-            new_anchor_normals = torch.zeros((new_xyz.shape[0], 3), device="cuda")
-            self.mesh_anchor_cached_normals = torch.cat((self.mesh_anchor_cached_normals, new_anchor_normals), dim=0)
-        if self.mesh_anchor_cached_reliable is not None:
-            new_anchor_reliable = torch.zeros((new_xyz.shape[0],), dtype=torch.bool, device="cuda")
-            self.mesh_anchor_cached_reliable = torch.cat((self.mesh_anchor_cached_reliable, new_anchor_reliable), dim=0)
+        if self.mesh_guidance_cached_normals is not None:
+            new_guidance_normals = torch.zeros((new_xyz.shape[0], 3), device="cuda")
+            self.mesh_guidance_cached_normals = torch.cat((self.mesh_guidance_cached_normals, new_guidance_normals), dim=0)
+        if self.mesh_guidance_cached_reliable is not None:
+            new_guidance_reliable = torch.zeros((new_xyz.shape[0],), dtype=torch.bool, device="cuda")
+            self.mesh_guidance_cached_reliable = torch.cat((self.mesh_guidance_cached_reliable, new_guidance_reliable), dim=0)
 
     def densify_and_split(self, grads, grad_threshold, grads_abs, grad_abs_threshold, scene_extent, max_radii2D, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -700,7 +699,7 @@ class GaussianModel:
             return
 
         # 先找出“被至少一个高斯覆盖到”的面片，剩下的就是候选空洞面片。
-        covered_face_mask, _, _ = compute_face_coverage_mask(face_centroids, current_points)
+        covered_face_mask, gs_to_mesh_dist, gs_to_mesh_idx = compute_face_coverage_mask(face_centroids, current_points)
         candidate_face_ids = visible_uncovered_face_ids(face_visible, covered_face_mask)
         if candidate_face_ids.numel() == 0:
             return
@@ -711,10 +710,22 @@ class GaussianModel:
 
         # 再在候选面片中挑出当前点云能够继续容纳的部分，避免超过总数上限。
         candidate_centroids = face_centroids[candidate_face_ids]
-        nn_d2, nn_idx, _ = knn_points(candidate_centroids.unsqueeze(0), current_points.unsqueeze(0), K=1)
-        nn_idx = nn_idx[0, :, 0]
-        nn_dist = torch.sqrt(torch.clamp_min(nn_d2[0, :, 0], 1e-12))
+        nn_dist, nn_idx = knn_1nn(candidate_centroids, current_points)
 
+        # 筛选条件：保留距离大于 scene_extent / 500 的候选
+        distance_threshold = scene_extent / 500
+        dist_mask = nn_dist > distance_threshold  # 生成布尔掩码
+
+        # 应用掩码，只保留满足距离条件的候选
+        candidate_face_ids = candidate_face_ids[dist_mask]
+        nn_dist = nn_dist[dist_mask]
+        nn_idx = nn_idx[dist_mask]
+        # ====================== 新增筛选代码 结束 ======================
+
+        # 筛选后如果没有剩余候选，直接返回
+        if candidate_face_ids.numel() == 0:
+            return
+        
         if candidate_face_ids.shape[0] > available_slots:
             keep_order = torch.argsort(nn_dist)[:available_slots]
             candidate_face_ids = candidate_face_ids[keep_order]
@@ -723,6 +734,10 @@ class GaussianModel:
         if candidate_face_ids.numel() == 0:
             return
 
+        # 记录：原有高斯数量 + 新增高斯数量（关键索引信息）
+        n_original = current_points.shape[0]  # densify前原有高斯数
+        n_new = candidate_face_ids.shape[0]   # 本次新增高斯数
+        
         # 面片中心作为新增高斯的位置，面法线作为其最短轴方向。
         selected_centroids = face_centroids[candidate_face_ids]
         selected_normals = face_normals[candidate_face_ids]
@@ -738,7 +753,16 @@ class GaussianModel:
             device=self._features_rest.device,
         )
         new_opacity = self._opacity[nn_idx]
-        new_scaling = self._scaling[nn_idx]
+        # 让新增高斯也沿面片法向保持更薄：先取最近高斯的三轴尺度，再把最小轴放到法向对应的局部 z 轴上。
+        nearest_scaling = self.get_scaling[nn_idx]
+        sorted_scaling, _ = torch.sort(nearest_scaling, dim=1)
+        normal_scale = torch.clamp_min(sorted_scaling[:, 0] * 0.5, 1e-6)
+        new_scaling = self.scaling_inverse_activation(
+            torch.stack(
+                [sorted_scaling[:, 2], sorted_scaling[:, 1], normal_scale],
+                dim=1,
+            )
+        )
         new_knn_f = self._knn_f[nn_idx]
 
         self.densification_postfix(
@@ -750,8 +774,19 @@ class GaussianModel:
             new_scaling,
             selected_rotation,
         )
+        
+        # 原有高斯：生成修剪掩码（距离 > scene_extent/50 → 标记删除True）
+        prune_dist_threshold = scene_extent / 50
+        prune_mask_original = gs_to_mesh_dist > prune_dist_threshold
+        # 新增高斯：全保留（掩码全False，设备与原有保持一致）
+        prune_mask_new = torch.zeros(n_new, dtype=torch.bool, device=prune_mask_original.device)
+        # 拼接掩码：原有 + 新增 → 长度匹配densify后的总高斯数
+        final_prune_mask = torch.cat([prune_mask_original, prune_mask_new])
+        # 执行修剪（仅当有需要删除的点时调用）
+        # if final_prune_mask.any():
+            # self.prune_points(final_prune_mask)
 
-    def densify_and_prune(self, max_grad, abs_max_grad, min_opacity, extent, max_screen_size):
+    def densify_and_prune(self, max_grad, abs_max_grad, min_opacity, extent, max_screen_size, mesh_guide=False):
         grads = self.xyz_gradient_accum / self.denom
         grads_abs = self.xyz_gradient_accum_abs / self.denom_abs
         grads[grads.isnan()] = 0.0
@@ -760,7 +795,8 @@ class GaussianModel:
 
         self.densify_and_clone(grads, max_grad, extent)
         self.densify_and_split(grads, max_grad, grads_abs, abs_max_grad, extent, max_radii2D)
-        self.densify_mesh_guided(grads, grads_abs, max_grad, abs_max_grad, extent, max_radii2D)
+        if mesh_guide:
+            self.densify_mesh_guided(grads, grads_abs, max_grad, abs_max_grad, extent, max_radii2D)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
 
@@ -812,111 +848,43 @@ class GaussianModel:
         pts = (pts-T)@R.transpose(-1,-2)
         return pts
 
-    def set_mesh_normal_anchor(self, mesh_path):
-        """Load initial mesh faces as anchor candidates for normal orientation."""
-        ply = PlyData.read(mesh_path)
-        if "face" not in ply or "vertex" not in ply:
-            raise ValueError(f"Mesh must contain both face and vertex elements: {mesh_path}")
-
-        verts = np.stack(
-            [
-                np.asarray(ply["vertex"]["x"], dtype=np.float32),
-                np.asarray(ply["vertex"]["y"], dtype=np.float32),
-                np.asarray(ply["vertex"]["z"], dtype=np.float32),
-            ],
-            axis=1,
-        )
-        face_props = ply["face"].data.dtype.names
-        if not all(k in face_props for k in ("nx", "ny", "nz")):
-            raise ValueError(f"Mesh face element must contain nx/ny/nz normals: {mesh_path}")
-        faces_raw = np.asarray(ply["face"].data["vertex_indices"])
-        faces = np.stack([np.asarray(f, dtype=np.int64) for f in faces_raw], axis=0)
-        if faces.size == 0:
-            raise ValueError(f"Mesh has zero faces: {mesh_path}")
-
-        v0 = verts[faces[:, 0]]
-        v1 = verts[faces[:, 1]]
-        v2 = verts[faces[:, 2]]
-        centroids = (v0 + v1 + v2) / 3.0
-        normals = np.stack(
-            [
-                np.asarray(ply["face"]["nx"], dtype=np.float32),
-                np.asarray(ply["face"]["ny"], dtype=np.float32),
-                np.asarray(ply["face"]["nz"], dtype=np.float32),
-            ],
-            axis=1,
-        )
-        n_norm = np.linalg.norm(normals, axis=1, keepdims=True)
-        valid = n_norm[:, 0] > 1e-12
-        if valid.sum() == 0:
-            raise ValueError(f"All face normals are degenerate in: {mesh_path}")
-
-        centroids = centroids[valid]
-        normals = normals[valid] / np.clip(n_norm[valid], 1e-12, None)
-
-        device = self._xyz.device if self._xyz.numel() > 0 else "cuda"
-        self.mesh_anchor_face_centroids = torch.tensor(centroids, dtype=torch.float32, device=device)
-        self.mesh_anchor_face_normals = torch.tensor(normals, dtype=torch.float32, device=device)
-
-        n_points = int(self._xyz.shape[0])
-        self.mesh_anchor_cached_normals = torch.zeros((n_points, 3), dtype=torch.float32, device=device)
-        self.mesh_anchor_cached_reliable = torch.zeros((n_points,), dtype=torch.bool, device=device)
-        return True
-
     def _knn_face_centroids(self, points):
-        if self.mesh_anchor_face_centroids is None or self.mesh_anchor_face_centroids.shape[0] == 0:
+        if self.mesh_guidance_face_centroids is None or self.mesh_guidance_face_centroids.shape[0] == 0:
             return None, None
 
-        if knn_points is not None:
-            d2, idx, _ = knn_points(points.unsqueeze(0), self.mesh_anchor_face_centroids.unsqueeze(0), K=1)
-            d = torch.sqrt(torch.clamp_min(d2[0, :, 0], 1e-12))
-            i = idx[0, :, 0]
-            return d, i
-
-        # Fallback for environments without pytorch3d.ops.knn_points.
-        n = points.shape[0]
-        nn_dist = torch.empty((n,), dtype=torch.float32, device=points.device)
-        nn_idx = torch.empty((n,), dtype=torch.long, device=points.device)
-        chunk = 4096
-        for start in range(0, n, chunk):
-            end = min(start + chunk, n)
-            dmat = torch.cdist(points[start:end], self.mesh_anchor_face_centroids)
-            d, i = torch.min(dmat, dim=1)
-            nn_dist[start:end] = d
-            nn_idx[start:end] = i
-        return nn_dist, nn_idx
+        return knn_1nn(points, self.mesh_guidance_face_centroids)
 
     @torch.no_grad()
     def update_mesh_normal_cache(self, distance_ratio=3.0, normal_cos_thresh=0.2):
-        """Refresh per-Gaussian mesh-anchor cache and reliability mask."""
+        """Refresh per-Gaussian mesh-guidance cache and reliability mask."""
         # 对当前高斯中心做最近邻搜索，找到初始 mesh 最近的面片中心
         # 同时检查两个门槛：
         # 距离是否足够近，阈值基于高斯的面内尺度，而不是最短轴厚度
-        # 当前高斯无向法线和锚点法线夹角是否不太离谱，abs(dot(raw_normal, anchor_normal)) >= normal_cos_thresh
-        if self.mesh_anchor_face_centroids is None or self._xyz.numel() == 0:
-            self.mesh_anchor_cached_normals = None
-            self.mesh_anchor_cached_reliable = None
+        # 当前高斯无向法线和引导法线夹角是否不太离谱，abs(dot(raw_normal, guidance_normal)) >= normal_cos_thresh
+        if self.mesh_guidance_face_centroids is None or self.mesh_guidance_face_normals is None or self._xyz.numel() == 0:
+            self.mesh_guidance_cached_normals = None
+            self.mesh_guidance_cached_reliable = None
             return
 
         points = self._xyz.detach()
         raw_normal = self.get_smallest_axis().detach()
         nn_dist, nn_idx = self._knn_face_centroids(points)
         if nn_idx is None:
-            self.mesh_anchor_cached_normals = None
-            self.mesh_anchor_cached_reliable = None
+            self.mesh_guidance_cached_normals = None
+            self.mesh_guidance_cached_reliable = None
             return
 
-        anchor_normal = self.mesh_anchor_face_normals[nn_idx]
-        anchor_normal = torch.nn.functional.normalize(anchor_normal, dim=1)
+        guidance_normal = self.mesh_guidance_face_normals[nn_idx]
+        guidance_normal = torch.nn.functional.normalize(guidance_normal, dim=1)
 
         sorted_scales, _ = torch.sort(self.get_scaling.detach(), dim=1)
         in_plane_scale = torch.sqrt(torch.clamp_min(sorted_scales[:, 1] * sorted_scales[:, 2], 1e-12))
         dist_thresh = torch.clamp(in_plane_scale * float(distance_ratio), min=1e-5)
-        cos_abs = torch.abs(torch.sum(raw_normal * anchor_normal, dim=1))
+        cos_abs = torch.abs(torch.sum(raw_normal * guidance_normal, dim=1))
         reliable = (nn_dist <= dist_thresh) & (cos_abs >= float(normal_cos_thresh))
 
-        self.mesh_anchor_cached_normals = anchor_normal
-        self.mesh_anchor_cached_reliable = reliable
+        self.mesh_guidance_cached_normals = guidance_normal
+        self.mesh_guidance_cached_reliable = reliable
     
     
     # 在训练循环中调用的函数，用于更新方向统计
@@ -958,18 +926,18 @@ class GaussianModel:
         n = raw_normal.shape[0]
         sign = torch.ones((n, 1), dtype=raw_normal.dtype, device=raw_normal.device)
 
-        anchor_ready = (
-            self.mesh_anchor_cached_normals is not None
-            and self.mesh_anchor_cached_reliable is not None
-            and self.mesh_anchor_cached_normals.shape[0] == n
-            and self.mesh_anchor_cached_reliable.shape[0] == n
+        guidance_ready = (
+            self.mesh_guidance_cached_normals is not None
+            and self.mesh_guidance_cached_reliable is not None
+            and self.mesh_guidance_cached_normals.shape[0] == n
+            and self.mesh_guidance_cached_reliable.shape[0] == n
         )
 
-        if anchor_ready:
-            reliable = self.mesh_anchor_cached_reliable
+        if guidance_ready:
+            reliable = self.mesh_guidance_cached_reliable
             if bool(torch.any(reliable)):
                 dot_mesh = torch.sum(
-                    raw_normal[reliable] * self.mesh_anchor_cached_normals[reliable],
+                    raw_normal[reliable] * self.mesh_guidance_cached_normals[reliable],
                     dim=1,
                     keepdim=True,
                 )
@@ -1035,7 +1003,7 @@ class GaussianModel:
         PlyData([el]).write(path)
         print(f"DEBUG: View direction visualization saved to {path}")
 
-    def extract_oriented_pointcloud(self, opacity_threshold=0.0, normalize_weight=True, visibility_mask=None, log_weight=False):
+    def extract_oriented_pointcloud(self, opacity_threshold=0.0, normalize_weight=True, visibility_mask=None, log_weight=False, use_cut_points=False):
         """
         导出有向点云（中心点版本）：
         - points: 高斯中心
@@ -1068,9 +1036,40 @@ class GaussianModel:
         if normalize_weight and weights.numel() > 0:
             weights = weights / (weights.max() + 1e-8)
 
+        if use_cut_points and points.numel() > 0:
+            rotation_matrices = self.get_rotation_matrix()[mask]
+            scales = self.get_scaling[mask]
+            sorted_scales, sorted_idx = torch.sort(scales, dim=-1)
+
+            def gather_axis(mats, axis_idx):
+                axis_idx = axis_idx[..., None, None].expand(-1, 3, 1)
+                return mats.gather(2, axis_idx).squeeze(2)
+
+            tangent_axis_0 = gather_axis(rotation_matrices, sorted_idx[:, 1])
+            tangent_axis_1 = gather_axis(rotation_matrices, sorted_idx[:, 2])
+
+            offset_0 = tangent_axis_0 * (sorted_scales[:, 1:2] * 0.5)
+            offset_1 = tangent_axis_1 * (sorted_scales[:, 2:3] * 0.5)
+
+            cut_points = torch.stack(
+                [
+                    points + offset_0 + offset_1,
+                    points + offset_0 - offset_1,
+                    points - offset_0 + offset_1,
+                    points - offset_0 - offset_1,
+                ],
+                dim=1,
+            ).reshape(-1, 3)
+            cut_normals = normals.repeat_interleave(4, dim=0)
+            cut_weights = (weights * 0.5).repeat_interleave(4, dim=0)
+
+            points = torch.cat([points, cut_points], dim=0)
+            normals = torch.cat([normals, cut_normals], dim=0)
+            weights = torch.cat([weights, cut_weights], dim=0)
+
         return points, normals, weights, mask
 
-    def save_oriented_pointcloud_ply(self, path, opacity_threshold=0.0, normalize_weight=True, visibility_mask=None, log_weight=False):
+    def save_oriented_pointcloud_ply(self, path, opacity_threshold=0.0, normalize_weight=True, visibility_mask=None, log_weight=False, use_cut_points=False):
         """
         保存有向点云到 PLY：
         - x, y, z
@@ -1084,6 +1083,7 @@ class GaussianModel:
             normalize_weight=normalize_weight,
             visibility_mask=visibility_mask,
             log_weight=log_weight,
+            use_cut_points=use_cut_points,
         )
 
         points_np = points.detach().cpu().numpy()

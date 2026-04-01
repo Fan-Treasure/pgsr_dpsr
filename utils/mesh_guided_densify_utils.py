@@ -4,6 +4,18 @@ import torch.nn.functional as F
 from pytorch3d.ops import knn_points
 
 
+def knn_1nn(query_points: torch.Tensor, reference_points: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """返回 query_points 到 reference_points 的一阶最近邻距离和索引。"""
+    if query_points.numel() == 0 or reference_points.numel() == 0:
+        empty_dist = torch.empty((query_points.shape[0],), dtype=torch.float32, device=query_points.device)
+        empty_idx = torch.empty((query_points.shape[0],), dtype=torch.long, device=query_points.device)
+        return empty_dist, empty_idx
+
+    d2, idx, _ = knn_points(query_points.unsqueeze(0), reference_points.unsqueeze(0), K=1)
+    dist = torch.sqrt(torch.clamp_min(d2[0, :, 0], 1e-12))
+    nn_idx = idx[0, :, 0]
+    return dist, nn_idx
+
 def compute_face_geometry(verts_world: torch.Tensor, faces: torch.Tensor, eps: float = 1e-12):
     """计算三角面的几何信息。
 
@@ -83,14 +95,12 @@ def compute_face_coverage_mask(
         covered = torch.zeros((face_centroids.shape[0],), dtype=torch.bool, device=face_centroids.device)
         return covered, None, None
 
-    d2, idx, _ = knn_points(gaussian_xyz.unsqueeze(0), face_centroids.unsqueeze(0), K=1)
-    nn_face_idx = idx[0, :, 0]
-    nn_face_dist = torch.sqrt(torch.clamp_min(d2[0, :, 0], 1e-12))
+    nn_face_dist, nn_face_idx = knn_1nn(gaussian_xyz, face_centroids)
 
     covered = torch.zeros((face_centroids.shape[0],), dtype=torch.bool, device=face_centroids.device)
     if nn_face_idx.numel() > 0:
         covered[torch.unique(nn_face_idx)] = True
-    return covered, nn_face_idx, nn_face_dist
+    return covered, nn_face_dist, nn_face_idx
 
 
 def visible_uncovered_face_ids(face_visible: torch.Tensor, covered_face_mask: torch.Tensor) -> torch.Tensor:

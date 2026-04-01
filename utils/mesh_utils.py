@@ -2,6 +2,7 @@ from typing import Dict, Iterable, Optional
 import pymeshlab as ml
 import numpy as np
 import plyfile
+import torch
 
 
 def _apply_filter_candidates(ms, candidates: Iterable[str], kwargs: Optional[Dict] = None) -> bool:
@@ -139,3 +140,20 @@ def compute_padded_bbox_from_mesh(mesh_path, padding=0.10):
     max_extent = float(np.max(pmax - pmin))
     half_extent = max(0.5 * max_extent * (1.0 + 2.0 * float(padding)), 1e-6)
     return center.astype(np.float32), float(half_extent)
+
+
+def load_mesh_vertices_faces(mesh_path):
+    ply = plyfile.PlyData.read(mesh_path)
+    verts = np.stack(
+        [
+            np.asarray(ply["vertex"]["x"], dtype=np.float32),
+            np.asarray(ply["vertex"]["y"], dtype=np.float32),
+            np.asarray(ply["vertex"]["z"], dtype=np.float32),
+        ],
+        axis=1,
+    )
+    faces_raw = np.asarray(ply["face"].data["vertex_indices"])
+    faces = np.stack([np.asarray(face, dtype=np.int64) for face in faces_raw], axis=0)
+    if faces.shape[1] != 3:
+        raise ValueError(f"Only triangular faces are supported, got face size {faces.shape[1]}")
+    return torch.tensor(verts, dtype=torch.float32, device="cuda"), torch.tensor(faces, dtype=torch.long, device="cuda")

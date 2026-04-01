@@ -6,13 +6,10 @@ import matplotlib.pyplot as plt
 from plyfile import PlyData, PlyElement
 from nvdiffrast_utils.dpsr import DPSR
 from nvdiffrast_utils.dpsr_utils import mc_from_psr, point_rasterize
+from nvdiffrast_utils.flexicubes import KaolinFlexiCubesBackend
 from utils.system_utils import mkdir_p
 from diso import DiffMC, DiffDMC
 
-try:
-    import kaolin as kal
-except ImportError:
-    kal = None
 
 SMALL_NUMBER = 1e-6
 
@@ -43,6 +40,8 @@ class MeshModel:
         self.fixed_aabb_center = None
         self.fixed_aabb_half_extent = None
         self.surface_prior = None
+        self.prior_center = None
+        self.prior_half_extent = None
         self.prior_thresh = 0.1
         self.prior_temp = 0.05
         self.prior_outside_value = 0.5
@@ -67,6 +66,9 @@ class MeshModel:
 
         self.diffmc = DiffMC(dtype=torch.float32).to(device)
         self.diffdmc = DiffDMC(dtype=torch.float32).to(device)
+        self.flexicubes = None
+        if self.mesh_backend == "flexicubes":
+            self.flexicubes = KaolinFlexiCubesBackend(resolution=self.grid_res, device=device)
 
     def _get_normalization_params(self, points_world):
         if self.normalization_mode == "fixed_aabb":
@@ -241,16 +243,27 @@ class MeshModel:
             verts, faces, _ = mc_from_psr(psr.unsqueeze(0), pytorchify=True, real_scale=False)
             return verts.to(torch.float32), faces.to(torch.int32)
 
-        raise ValueError(f"Unknown mesh backend: {self.mesh_backend}. Use 'diffmc', 'diffdmc', or 'mc'.")
+        if self.mesh_backend == "flexicubes":
+            verts, faces = self.flexicubes.extract(psr, output_tetmesh=False, training=False, grad_func=None)
+            return verts.to(torch.float32), faces.to(torch.int32)
+
+        raise ValueError(f"Unknown mesh backend: {self.mesh_backend}. Use 'diffmc', 'diffdmc', 'mc', or 'flexicubes'.")
 
     def _to_world(self, verts, center, half_extent):
         verts = (verts - 0.5) * (2.0 * half_extent) + center[None]
         return verts
 
+    def _to_world_centered(self, verts, center, half_extent):
+        verts = verts * (2.0 * half_extent) + center[None]
+        return verts
+
     def reconstruct(self, points_world, normals_world, weights=None):
         psr, center, half_extent = self._build_psr(points_world, normals_world, weights)
         verts, faces = self._extract_mesh(psr)
-        verts_world = self._to_world(verts, center, half_extent)
+        if self.mesh_backend == "flexicubes":
+            verts_world = self._to_world_centered(verts, center, half_extent)
+        else:
+            verts_world = self._to_world(verts, center, half_extent)
         return {"psr": psr, "verts": verts_world, "faces": faces}
 
     @staticmethod
