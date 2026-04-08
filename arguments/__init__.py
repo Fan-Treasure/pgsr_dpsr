@@ -120,7 +120,7 @@ class OptimizationParams(ParamGroup):
         self.mesh_from_iter = 5000
         self.no_surface_prior = False
         self.detach_gaussian_rendering = False
-        self.grid_res_in_the_loop = 360
+        self.grid_res_in_the_loop = 288
         self.mesh_opacity_threshold = 0.05
         self.use_cut_points_for_mesh = False
         self.view_dir_decay = 0.5

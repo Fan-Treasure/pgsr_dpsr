@@ -1,12 +1,12 @@
 import os
 
 scenes = [24, 37, 40, 55, 63, 65, 69, 83, 97, 105, 106, 110, 114, 118, 122]
-scenes = [110]
+scenes = [97]
 data_base_path='workdir/DTU'
 out_base_path='output_dtu'
 eval_path='workdir/DTU'
 out_name='test'
-gpu_id=6
+gpu_id=1
 
 for scene in scenes:
     cmd = f'rm -rf {out_base_path}/dtu_scan{scene}/{out_name}/*'
@@ -24,7 +24,7 @@ for scene in scenes:
     # CUDA_VISIBLE_DEVICES=1 python train.py -s workdir/DTU/scan24/ -m outputs/debug24/ --quiet -r2 --ncc_scale 0.5
 
     common_args = "--quiet --num_cluster 1 --voxel_size 0.002 --max_depth 5.0"
-    cmd = f'CUDA_VISIBLE_DEVICES={gpu_id} python render.py -m {out_base_path}/dtu_scan{scene}/{out_name} {common_args}'
+    cmd = f'OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES={gpu_id} python render.py -m {out_base_path}/dtu_scan{scene}/{out_name} {common_args}'
     print(cmd)
     os.system(cmd)
     # CUDA_VISIBLE_DEVICES=0 python render.py -m outputs/debug24/ --quiet --num_cluster 1 --voxel_size 0.002 --max_depth 5.0
