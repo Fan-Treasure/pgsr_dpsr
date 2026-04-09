@@ -11,6 +11,7 @@
 
 import torch
 import numpy as np
+from typing import Optional
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation, build_scaling
 from torch import nn
 import os
@@ -27,6 +28,7 @@ from utils.mesh_guided_densify_utils import (
     visible_uncovered_face_ids,
     build_orthonormal_frame_from_normals,
 )
+from utils.mesh_utils import sample_faces_by_area
 
 def dilate(bin_img, ksize=5):
     pad = (ksize - 1) // 2
@@ -238,6 +240,8 @@ class GaussianModel:
         opacity_init: float = 0.10,
         min_scale_ratio: float = 1e-4,
         max_scale_ratio: float = 0.05,
+        max_init_faces: Optional[int] = None,
+        scene_level_scale_boost: float = 1.0,
     ):
         """Initialize one Gaussian per mesh face using face centroids and normals."""
         self.spatial_lr_scale = spatial_lr_scale
@@ -258,6 +262,17 @@ class GaussianModel:
         faces = np.stack([np.asarray(f, dtype=np.int64) for f in faces_raw], axis=0)
         if faces.shape[1] != 3:
             raise ValueError(f"Only triangular faces are supported, got face size {faces.shape[1]}")
+
+        if max_init_faces is not None and faces.shape[0] > int(max_init_faces):
+            faces = sample_faces_by_area(
+                verts=verts,
+                faces=faces,
+                max_faces=int(max_init_faces),
+            )
+            print(
+                f"Scene-level mesh initialization: sampled {faces.shape[0]} / {faces_raw.shape[0]} faces "
+                f"(area-weighted)"
+            )
 
         has_color = all(c in ply["vertex"].data.dtype.names for c in ["red", "green", "blue"])
         if has_color:
@@ -316,6 +331,8 @@ class GaussianModel:
 
         span_u = np.maximum(np.maximum(u0, u1), u2)
         span_v = np.maximum(np.maximum(v0p, v1p), v2p)
+
+        tangent_scale = float(tangent_scale) * float(max(scene_level_scale_boost, 1.0))
 
         scene_scale = max(float(spatial_lr_scale), 1e-6)
         min_scale = scene_scale * float(min_scale_ratio)

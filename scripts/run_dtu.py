@@ -1,7 +1,7 @@
 import os
 
 scenes = [24, 37, 40, 55, 63, 65, 69, 83, 97, 105, 106, 110, 114, 118, 122]
-scenes = [97]
+scenes = [24]
 data_base_path='workdir/DTU'
 out_base_path='output_dtu'
 eval_path='workdir/DTU'

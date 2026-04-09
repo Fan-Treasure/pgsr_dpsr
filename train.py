@@ -39,6 +39,7 @@ from scene.cameras import Camera
 from scene.mesh_model import MeshModel
 from mesh_renderer import render as render_mesh_normal_depth
 from utils.mesh_guided_densify_utils import compute_face_geometry
+from plyfile import PlyData
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -108,10 +109,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     mesh_init_path = os.path.join(dataset.source_path, "mesh_init.ply")
     repaired_mesh_path = os.path.join(dataset.model_path, "mesh_init_filled.ply")
+    mesh_init_ply = PlyData.read(mesh_init_path)
+    initial_face_count = np.asarray(mesh_init_ply["face"].data["vertex_indices"]).shape[0]
+    is_scene_level_mesh = initial_face_count > 1_000_000
+    init_max_faces = 1_000_000 if is_scene_level_mesh else None
+    scene_level_scale_boost = min(np.sqrt(initial_face_count / 1_000_000.0), 2.0) if is_scene_level_mesh else 1.0
+    if is_scene_level_mesh:
+        print(f"Scene-level mesh detected: {initial_face_count} faces. ")
     clean_and_repair(
         input_mesh_path=mesh_init_path,
         output_mesh_path=repaired_mesh_path,
-        max_hole_size=100,
     )
     mesh_for_init = repaired_mesh_path
     print(f"Using mesh-based Gaussian initialization: {mesh_for_init}")
@@ -123,6 +130,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         opacity_init=0.10,
         min_scale_ratio=1e-4,
         max_scale_ratio=0.05,
+        max_init_faces=init_max_faces,
+        scene_level_scale_boost=scene_level_scale_boost,
     )
 
     gaussians.training_setup(opt)
@@ -159,7 +168,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # Pre-create mesh_model to avoid repeated instantiation inside the loop
     mesh_model = MeshModel(
         grid_res=opt.grid_res_in_the_loop,
-        dpsr_sig=3.0,
+        dpsr_sig=0.0,
         density_thres=0,
         nerf_normalization=scene.nerf_normalization,
         normalization_mode="fixed_aabb",
@@ -180,7 +189,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         )
         mesh_model.export_surface_prior_ply(os.path.join(scene.model_path, "surface_prior_points.ply"), threshold=0.3)
 
-    init_mesh_verts, init_mesh_faces = load_mesh_vertices_faces(mesh_for_init)
+    init_mesh_verts, init_mesh_faces = load_mesh_vertices_faces(
+        mesh_for_init,
+        max_faces=init_max_faces,
+        sample_by_area=is_scene_level_mesh,
+    )
     init_mesh_geometry = compute_face_geometry(init_mesh_verts, init_mesh_faces)
 
     def refresh_normal_flip_guidance_from_initial_mesh():
@@ -430,6 +443,41 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         mesh_path = os.path.join(scene.model_path, "debug_viz", f"dpsr_diffmc_mesh_{iteration}.ply")
                         mesh_model.save_mesh_ply(mesh_path, mesh_out["verts"], mesh_out["faces"])
                     cv2.imwrite(os.path.join(debug_path, "%05d"%iteration + "_" + viewpoint_cam.image_name + ".jpg"), image_to_show)
+                # 在 iteration 大于 9900 且 当前相机名为 '33' 时，额外保存单张图像到 debug 目录
+                '''if iteration > 5000 and viewpoint_cam.image_name == '0033':
+                    special_dir = os.path.join(debug_path, "special_saves")
+                    os.makedirs(special_dir, exist_ok=True)
+                    # 渲染 RGB（优先使用已构造的 img_show）
+                    if 'app_image' in render_pkg:
+                        img_show = ((render_pkg['app_image']).permute(1,2,0).clamp(0,1)[:,:,[2,1,0]]*255).detach().cpu().numpy().astype(np.uint8)
+                    else:
+                        img_show = ((image).permute(1,2,0).clamp(0,1)[:,:,[2,1,0]]*255).detach().cpu().numpy().astype(np.uint8)
+                    rgb_fname = os.path.join(special_dir, f"render_rgb_iter{iteration}_{viewpoint_cam.image_name}.png")
+                    cv2.imwrite(rgb_fname, img_show)
+                    # 高斯法线（normal_show 已是 uint8 (H,W,3)）
+                    normal_show = (((normal+1.0)*0.5).permute(1,2,0).clamp(0,1)*255).detach().cpu().numpy().astype(np.uint8)
+                    gauss_n_fname = os.path.join(special_dir, f"gauss_normal_iter{iteration}_{viewpoint_cam.image_name}.png")
+                    cv2.imwrite(gauss_n_fname, normal_show)
+                    # 高斯深度（depth_color 已是 uint8 单通道/伪彩色）
+                    depth = render_pkg['plane_depth'].squeeze().detach().cpu().numpy()
+                    depth_i = (depth - depth.min()) / (depth.max() - depth.min() + 1e-20)
+                    depth_i = (depth_i * 255).clip(0, 255).astype(np.uint8)
+                    depth_color = cv2.applyColorMap(depth_i, cv2.COLORMAP_JET)
+                    gauss_d_fname = os.path.join(special_dir, f"gauss_depth_iter{iteration}_{viewpoint_cam.image_name}.png")
+                    cv2.imwrite(gauss_d_fname, depth_color)
+                    # 如果有 mesh 渲染结果，再保存 mesh 法线和 mesh 深度
+                    rend_normal_t = ((mesh_normal + 1.0) * 0.5).permute(1, 2, 0).clamp(0, 1)
+                    mesh_normal_show = (rend_normal_t * 255).detach().cpu().numpy().astype(np.uint8)
+                    # mesh depth -> single-channel -> apply colormap like depth_color
+                    depth_arr = mesh_depth.squeeze().detach().cpu().numpy()
+                    d_min, d_max = depth_arr.min(), depth_arr.max()
+                    depth_norm = (depth_arr - d_min) / (d_max - d_min)
+                    depth_u8 = (depth_norm * 255).clip(0, 255).astype(np.uint8)
+                    mesh_depth_show = cv2.applyColorMap(depth_u8, cv2.COLORMAP_JET)
+                    mesh_n_fname = os.path.join(special_dir, f"mesh_normal_iter{iteration}_{viewpoint_cam.image_name}.png")
+                    cv2.imwrite(mesh_n_fname, mesh_normal_show)
+                    mesh_d_fname = os.path.join(special_dir, f"mesh_depth_iter{iteration}_{viewpoint_cam.image_name}.png")
+                    cv2.imwrite(mesh_d_fname, mesh_depth_show)'''
 
                 if d_mask.sum() > 0:
                     geo_loss = geo_weight * ((weights * pixel_noise)[d_mask]).mean()

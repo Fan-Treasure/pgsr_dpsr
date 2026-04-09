@@ -5,6 +5,41 @@ import plyfile
 import torch
 
 
+def sample_faces_by_area(
+    verts: np.ndarray,
+    faces: np.ndarray,
+    max_faces: int,
+    rng: Optional[np.random.Generator] = None,
+) -> np.ndarray:
+    """Sample up to max_faces triangular faces with probability proportional to area."""
+
+    if max_faces is None or faces.shape[0] <= int(max_faces):
+        return faces
+
+    if verts.ndim != 2 or verts.shape[1] != 3:
+        raise ValueError(f"Unexpected vertex array shape: {verts.shape}")
+    if faces.ndim != 2 or faces.shape[1] != 3:
+        raise ValueError(f"Unexpected face array shape: {faces.shape}")
+
+    v0 = verts[faces[:, 0]]
+    v1 = verts[faces[:, 1]]
+    v2 = verts[faces[:, 2]]
+    areas = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0), axis=1)
+    valid = areas > 1e-12
+    if not np.any(valid):
+        raise ValueError("Cannot area-sample from a mesh with no valid triangular faces.")
+
+    valid_face_ids = np.nonzero(valid)[0]
+    valid_areas = areas[valid]
+    valid_areas = valid_areas / valid_areas.sum()
+
+    target_faces = min(int(max_faces), int(valid_face_ids.shape[0]))
+    rng = rng or np.random.default_rng()
+    sampled_local = rng.choice(valid_face_ids.shape[0], size=target_faces, replace=False, p=valid_areas)
+    sampled_ids = valid_face_ids[sampled_local]
+    return faces[sampled_ids]
+
+
 def _apply_filter_candidates(ms, candidates: Iterable[str], kwargs: Optional[Dict] = None) -> bool:
     kwargs = kwargs or {}
     for name in candidates:
@@ -142,7 +177,7 @@ def compute_padded_bbox_from_mesh(mesh_path, padding=0.10):
     return center.astype(np.float32), float(half_extent)
 
 
-def load_mesh_vertices_faces(mesh_path):
+def load_mesh_vertices_faces(mesh_path, max_faces=None, sample_by_area: bool = False):
     ply = plyfile.PlyData.read(mesh_path)
     verts = np.stack(
         [
@@ -156,4 +191,12 @@ def load_mesh_vertices_faces(mesh_path):
     faces = np.stack([np.asarray(face, dtype=np.int64) for face in faces_raw], axis=0)
     if faces.shape[1] != 3:
         raise ValueError(f"Only triangular faces are supported, got face size {faces.shape[1]}")
+
+    if max_faces is not None and faces.shape[0] > int(max_faces):
+        if sample_by_area:
+            faces = sample_faces_by_area(verts, faces, int(max_faces))
+        else:
+            sampled_ids = np.random.default_rng().choice(faces.shape[0], size=int(max_faces), replace=False)
+            faces = faces[sampled_ids]
+
     return torch.tensor(verts, dtype=torch.float32, device="cuda"), torch.tensor(faces, dtype=torch.long, device="cuda")
